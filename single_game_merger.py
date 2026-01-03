@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-SINGLE GAME MERGER - Ripristina UN SOLO gioco Xbox con merge chirurgico della FAT
+SINGLE GAME MERGER v4 - Backup/Restore DINAMICO per Xbox saves
 
-Questo script:
-1. Legge le catene FAT dal backup funzionante
-2. Identifica quali cluster appartengono al gioco da ripristinare
-3. Copia SOLO quei cluster e le relative entry FAT
-4. NON tocca gli altri giochi
+NOVITA' v4:
+- Calcolo DINAMICO di tutte le aree necessarie
+- NON richiede piu' metadata_areas hardcoded
+- Trova automaticamente il gioco per Title ID
+- Scansiona ricorsivamente la struttura del gioco
 
-IMPORTANTE: Usa merge chirurgico, non sovrascrittura!
+Testato con: Mercenaries (4c410015)
 """
 
 import os
@@ -17,8 +17,7 @@ import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Set, Optional, Tuple
 
 # =============================================================================
 # CONFIGURAZIONE
@@ -28,235 +27,326 @@ HDD_SOURCE = r"D:\xemu\bk\xbox_hdd2.qcow2"  # Backup funzionante (SOLO LETTURA)
 HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"       # HDD da modificare
 BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
 
-# Struttura Xbox FATX (da analisi precedente)
-FAT_TABLE_OFFSET = 0x00161000  # FAT16 Table della partizione E
-FAT32_TABLE_OFFSET = 0x00311000  # FAT32 Table (seconda copia/altra partizione)
-CLUSTER_SIZE = 16384           # 16KB
-DATA_START = 0x00443000        # Inizio area dati (VERIFICATO!)
+# Struttura Xbox FATX
+FAT_TABLE_OFFSET = 0x00161000   # FAT16 Table
+FAT32_TABLE_OFFSET = 0x00311000 # FAT32 Table
+CLUSTER_SIZE = 16384            # 16KB
+DATA_START = 0x00443000         # Inizio area dati
+ENTRY_SIZE = 64                 # Directory entry size
 
-# Directory entries
-GAME_DIR_OFFSET = 0x00447000   # Directory che contiene i game ID
-ENTRY_SIZE = 64                # Ogni directory entry è 64 bytes
-
-# Giochi conosciuti - ora senza metadata_areas hardcoded!
-# Gli offset FAT32 vengono calcolati dinamicamente dalla FAT chain
-GAMES = {
-    "4c410015": {
-        "name": "Mercenaries",
-        "dir_entry_offset": 0x00447000,
-        "first_cluster": 4,
-    },
-    "5345000f": {
-        "name": "ToeJam & Earl III", 
-        "dir_entry_offset": 0x00447040,
-        "first_cluster": 39,
-    },
+# Database nomi giochi (opzionale, per visualizzazione)
+GAME_NAMES = {
+    "4c410015": "Mercenaries",
+    "5345000f": "ToeJam & Earl III",
 }
-
-def calculate_fat32_offsets(fat_chain: list) -> list:
-    """
-    Calcola gli offset FAT32 per ogni cluster nella catena.
-    Formula: FAT32_TABLE_OFFSET + (cluster * 4)
-    """
-    offsets = []
-    for cluster in fat_chain:
-        offset = FAT32_TABLE_OFFSET + (cluster * 4)
-        offsets.append((offset, 4))  # (offset, size)
-    return offsets
 
 # =============================================================================
 # FUNZIONI FAT
 # =============================================================================
 
-def read_fat_entry(data: bytes, fat_start: int, cluster: int) -> int:
+def read_fat16_entry(data: bytes, cluster: int) -> int:
     """Legge una entry FAT16 (2 bytes)."""
-    offset = fat_start + (cluster * 2)
+    offset = FAT_TABLE_OFFSET + (cluster * 2)
     if offset + 2 > len(data):
         return 0xFFFF
     return struct.unpack('<H', data[offset:offset + 2])[0]
 
-def get_fat_chain(data: bytes, fat_start: int, first_cluster: int, max_length: int = 10000) -> List[int]:
+def read_fat32_entry(data: bytes, cluster: int) -> int:
+    """Legge una entry FAT32 (4 bytes)."""
+    offset = FAT32_TABLE_OFFSET + (cluster * 4)
+    if offset + 4 > len(data):
+        return 0xFFFFFFFF
+    return struct.unpack('<I', data[offset:offset + 4])[0]
+
+def get_fat_chain(data: bytes, first_cluster: int, max_length: int = 50000) -> List[int]:
     """Costruisce la catena FAT partendo dal primo cluster."""
+    if first_cluster == 0 or first_cluster >= 0xFFF0:
+        return []
+    
     chain = [first_cluster]
     current = first_cluster
+    seen = set([first_cluster])
     
     for _ in range(max_length):
-        next_cluster = read_fat_entry(data, fat_start, current)
+        next_cluster = read_fat16_entry(data, current)
         
-        # End of chain (FAT16)
-        if next_cluster >= 0xFFF8:
+        if next_cluster >= 0xFFF8 or next_cluster == 0x0000:
             break
-        if next_cluster == 0x0000:
+        if next_cluster in seen:  # Loop protection
             break
         
         chain.append(next_cluster)
+        seen.add(next_cluster)
         current = next_cluster
     
     return chain
 
-def cluster_to_offset(cluster: int, data_start: int = DATA_START) -> int:
-    """Converte numero cluster in offset fisico."""
-    # Cluster 0 e 1 sono riservati
-    return data_start + ((cluster - 2) * CLUSTER_SIZE)
+def cluster_to_offset(cluster: int) -> int:
+    """Converte numero cluster in offset fisico nei dati."""
+    return DATA_START + ((cluster - 2) * CLUSTER_SIZE)
 
 # =============================================================================
-# BACKUP SINGOLO GIOCO
+# PARSING DIRECTORY
 # =============================================================================
 
-def backup_single_game(game_id: str) -> Tuple[str, str]:
-    """
-    Crea un backup chirurgico di un singolo gioco.
-    Salva: directory entry, FAT entries, cluster dati.
-    """
-    print("=" * 70)
-    print(f"📦 BACKUP CHIRURGICO: {GAMES[game_id]['name']}")
-    print("=" * 70)
+def parse_directory_entry(data: bytes, offset: int) -> Optional[Dict]:
+    """Parsa una directory entry FATX (64 bytes)."""
+    if offset + ENTRY_SIZE > len(data):
+        return None
     
-    if game_id not in GAMES:
-        print(f"❌ Gioco non conosciuto: {game_id}")
-        return None, None
+    entry_data = data[offset:offset + ENTRY_SIZE]
+    fn_len = entry_data[0]
     
-    game = GAMES[game_id]
+    # Entry vuote, fine directory, o eliminate
+    if fn_len == 0xFF or fn_len == 0x00 or fn_len == 0xE5:
+        return None
+    
+    if fn_len > 42:
+        return None
+    
+    attrs = entry_data[1]
+    try:
+        filename = entry_data[2:2 + fn_len].decode('ascii', errors='replace').rstrip('\x00\xff')
+    except:
+        return None
+    
+    first_cluster = struct.unpack('<I', entry_data[44:48])[0]
+    file_size = struct.unpack('<I', entry_data[48:52])[0]
+    
+    # Validazione: cluster troppo alto = garbage
+    if first_cluster > 50000:
+        return None
+    
+    return {
+        'offset': offset,
+        'filename': filename,
+        'attrs': attrs,
+        'is_dir': bool(attrs & 0x10),
+        'first_cluster': first_cluster,
+        'file_size': file_size,
+        'raw': entry_data
+    }
+
+def scan_directory(data: bytes, first_cluster: int, max_clusters: int = 2) -> List[Dict]:
+    """Scansiona una directory e ritorna le entries valide."""
+    entries = []
+    chain = get_fat_chain(data, first_cluster)
+    
+    for cluster in chain[:max_clusters]:
+        cluster_offset = cluster_to_offset(cluster)
+        for i in range(CLUSTER_SIZE // ENTRY_SIZE):
+            offset = cluster_offset + i * ENTRY_SIZE
+            entry = parse_directory_entry(data, offset)
+            if entry:
+                entries.append(entry)
+    
+    return entries
+
+# =============================================================================
+# ANALISI DINAMICA GIOCO
+# =============================================================================
+
+def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
+    """
+    Analizza dinamicamente un gioco e calcola TUTTE le aree necessarie.
+    
+    Ritorna un dizionario con:
+    - all_clusters: set di tutti i cluster usati
+    - directory_entries: lista di (offset, data) per ogni directory entry
+    - fat16_entries: lista di (cluster, value) per FAT16
+    - fat32_entries: lista di (cluster, offset, data) per FAT32
+    - data_chunks: lista di (cluster, offset, data) per i dati
+    """
+    print(f"\n{'='*60}")
+    print(f"ANALISI DINAMICA: {game_id}")
+    print(f"{'='*60}")
+    
+    result = {
+        'game_id': game_id,
+        'game_name': GAME_NAMES.get(game_id, game_id),
+        'all_clusters': set(),
+        'directory_entries': [],  # (offset, raw_data)
+        'fat16_entries': [],      # (cluster, value)
+        'fat32_entries': [],      # (cluster, offset, data)
+        'data_chunks': [],        # (cluster, offset, data)
+    }
+    
+    # 1. Trova game in UDATA (cluster 4)
+    print("\n[1] Cerca gioco in UDATA...")
+    udata_entries = scan_directory(data, 4)
+    game_entry = None
+    
+    for e in udata_entries:
+        if e['filename'].lower() == game_id.lower():
+            game_entry = e
+            print(f"    Trovato: '{e['filename']}' @ 0x{e['offset']:08x} -> cluster {e['first_cluster']}")
+            break
+    
+    if not game_entry:
+        print(f"    ERRORE: Gioco {game_id} non trovato in UDATA!")
+        return None
+    
+    # Salva entry UDATA del gioco
+    result['directory_entries'].append((game_entry['offset'], game_entry['raw']))
+    
+    # 2. Scansiona cartella gioco
+    print(f"\n[2] Scansiona cartella gioco (cluster {game_entry['first_cluster']})...")
+    
+    game_folder_chain = get_fat_chain(data, game_entry['first_cluster'])
+    result['all_clusters'].update(game_folder_chain)
+    print(f"    Folder chain: {len(game_folder_chain)} clusters")
+    
+    game_contents = scan_directory(data, game_entry['first_cluster'])
+    print(f"    Entries trovate: {len(game_contents)}")
+    
+    for e in game_contents:
+        t = 'DIR' if e['is_dir'] else 'FILE'
+        print(f"    {t:4} {e['filename']:<25} cluster={e['first_cluster']:>5}")
+        
+        result['directory_entries'].append((e['offset'], e['raw']))
+        
+        if e['first_cluster'] > 0:
+            chain = get_fat_chain(data, e['first_cluster'])
+            result['all_clusters'].update(chain)
+        
+        # Subdirectory - scansiona ricorsivamente
+        if e['is_dir'] and e['first_cluster'] > 0:
+            sub_entries = scan_directory(data, e['first_cluster'])
+            for se in sub_entries:
+                st = 'DIR' if se['is_dir'] else 'FILE'
+                print(f"      -> {st:4} {se['filename']:<20} cluster={se['first_cluster']:>5}")
+                
+                result['directory_entries'].append((se['offset'], se['raw']))
+                
+                if se['first_cluster'] > 0:
+                    sub_chain = get_fat_chain(data, se['first_cluster'])
+                    result['all_clusters'].update(sub_chain)
+    
+    # 3. Calcola entries FAT16 e FAT32
+    print(f"\n[3] Calcola entries FAT...")
+    sorted_clusters = sorted(result['all_clusters'])
+    print(f"    Cluster totali: {len(sorted_clusters)}")
+    print(f"    Range: {sorted_clusters[0]} - {sorted_clusters[-1]}")
+    
+    for cluster in sorted_clusters:
+        # FAT16
+        fat16_value = read_fat16_entry(data, cluster)
+        result['fat16_entries'].append((cluster, fat16_value))
+        
+        # FAT32
+        fat32_offset = FAT32_TABLE_OFFSET + (cluster * 4)
+        fat32_data = data[fat32_offset:fat32_offset + 4]
+        result['fat32_entries'].append((cluster, fat32_offset, fat32_data))
+    
+    print(f"    FAT16 entries: {len(result['fat16_entries'])}")
+    print(f"    FAT32 entries: {len(result['fat32_entries'])}")
+    
+    # 4. Estrai data chunks
+    print(f"\n[4] Estrai data chunks...")
+    for cluster in sorted_clusters:
+        cluster_offset = cluster_to_offset(cluster)
+        if cluster_offset + CLUSTER_SIZE <= len(data):
+            chunk_data = data[cluster_offset:cluster_offset + CLUSTER_SIZE]
+            result['data_chunks'].append((cluster, cluster_offset, chunk_data))
+    
+    total_data = len(result['data_chunks']) * CLUSTER_SIZE
+    print(f"    Data chunks: {len(result['data_chunks'])} ({total_data:,} bytes)")
+    
+    # 5. Riepilogo
+    print(f"\n[5] Riepilogo:")
+    print(f"    Directory entries: {len(result['directory_entries'])}")
+    print(f"    FAT16 entries: {len(result['fat16_entries'])}")
+    print(f"    FAT32 entries: {len(result['fat32_entries'])}")
+    print(f"    Data chunks: {len(result['data_chunks'])}")
+    
+    return result
+
+# =============================================================================
+# BACKUP DINAMICO
+# =============================================================================
+
+def backup_single_game_v4(game_id: str) -> Tuple[str, str]:
+    """
+    Crea un backup DINAMICO di un singolo gioco.
+    Formato v4: calcola automaticamente tutte le aree necessarie.
+    """
+    print("\n" + "=" * 70)
+    print(f"BACKUP DINAMICO v4: {game_id}")
+    print("=" * 70)
     
     # Leggi HDD sorgente
-    print(f"\n📂 Lettura: {Path(HDD_SOURCE).name}")
+    print(f"\nLettura: {Path(HDD_SOURCE).name}")
     with open(HDD_SOURCE, 'rb') as f:
         data = f.read()
+    print(f"Size: {len(data):,} bytes")
     
-    # --- 1. DIRECTORY ENTRY ---
-    print(f"\n📋 1. Directory Entry")
-    dir_entry = data[game['dir_entry_offset']:game['dir_entry_offset'] + ENTRY_SIZE]
-    print(f"   Offset: 0x{game['dir_entry_offset']:08x}")
-    print(f"   Size: {len(dir_entry)} bytes")
+    # Analisi dinamica
+    analysis = analyze_game_dynamic(data, game_id)
+    if not analysis:
+        print("ERRORE: Analisi fallita!")
+        return None, None
     
-    # --- 2. FAT CHAIN ---
-    print(f"\n📋 2. FAT Chain")
-    fat_chain = get_fat_chain(data, FAT_TABLE_OFFSET, game['first_cluster'])
-    print(f"   First cluster: {game['first_cluster']}")
-    print(f"   Chain length: {len(fat_chain)}")
-    print(f"   Clusters: {fat_chain[:10]}{'...' if len(fat_chain) > 10 else ''}")
+    # Serializza backup
+    print(f"\nCreazione backup...")
     
-    # Estrai FAT entries (cluster_num, fat_value)
-    fat_entries = []
-    for cluster in fat_chain:
-        fat_value = read_fat_entry(data, FAT_TABLE_OFFSET, cluster)
-        fat_entries.append((cluster, fat_value))
-    print(f"   FAT entries salvate: {len(fat_entries)}")
-    
-    # --- 3. DATA CLUSTERS ---
-    print(f"\n📋 3. Data Clusters")
-    data_chunks = []
-    for cluster in fat_chain:
-        offset = cluster_to_offset(cluster)
-        if offset + CLUSTER_SIZE <= len(data):
-            chunk = data[offset:offset + CLUSTER_SIZE]
-            data_chunks.append((cluster, offset, chunk))
-    print(f"   Cluster estratti: {len(data_chunks)}")
-    total_data_size = sum(len(c[2]) for c in data_chunks)
-    print(f"   Dimensione totale: {total_data_size:,} bytes ({total_data_size // 1024} KB)")
-    
-    # --- 4. AREE EXTRA (directory UDATA entry, SaveMeta, etc) ---
-    print(f"\n📋 4. Aree Extra")
-    extra_areas = []
-    
-    # Cerca il game ID in altre aree
-    game_id_bytes = game_id.encode('ascii')
-    pos = 0
-    found_areas = set()
-    while True:
-        pos = data.find(game_id_bytes, pos)
-        if pos == -1:
-            break
-        area_start = (pos // 0x1000) * 0x1000  # Allinea a 4KB
-        if area_start not in found_areas and area_start not in [c[1] for c in data_chunks]:
-            # Non è già un cluster dati
-            found_areas.add(area_start)
-            area_data = data[area_start:area_start + 0x1000]
-            extra_areas.append((area_start, area_data))
-            print(f"   Extra area: 0x{area_start:08x} (4KB)")
-        pos += 1
-    
-    # --- 5. FAT32 ENTRIES (calcolate dinamicamente!) ---
-    print(f"\n📋 5. FAT32 Entries (calcolo dinamico)")
-    
-    # Calcola offset FAT32 per ogni cluster nella catena
-    fat32_entries = []
-    for cluster in fat_chain:
-        offset = FAT32_TABLE_OFFSET + (cluster * 4)
-        if offset + 4 <= len(data):
-            entry_data = data[offset:offset + 4]
-            fat32_entries.append((cluster, offset, entry_data))
-    
-    print(f"   Calcolati {len(fat32_entries)} offset FAT32 dalla catena")
-    if fat32_entries:
-        first_offset = fat32_entries[0][1]
-        last_offset = fat32_entries[-1][1]
-        print(f"   Range: 0x{first_offset:08x} - 0x{last_offset:08x}")
-    
-    # --- SALVA BACKUP ---
-    print(f"\n💾 Salvataggio backup...")
-    
-    backup_dir = Path(BACKUP_DIR)
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = backup_dir / f"{game_id}_surgical_{timestamp}.bin"
-    metadata_file = backup_dir / f"{game_id}_surgical_{timestamp}.json"
-    
-    # Serializza dati binari
     all_data = b""
     
-    # Header custom (magic + versione)
-    all_data += b"XBSV"  # Xbox Save Version
-    all_data += struct.pack('<I', 3)  # Versione 3 (con FAT32 dinamico)
+    # Header
+    all_data += b"XBSV"  # Magic
+    all_data += struct.pack('<I', 4)  # Versione 4 (dinamico)
     
-    # Directory entry
-    all_data += struct.pack('<I', len(dir_entry))
-    all_data += dir_entry
+    # Game ID (8 bytes, padded)
+    game_id_bytes = game_id.encode('ascii')[:8].ljust(8, b'\x00')
+    all_data += game_id_bytes
     
-    # FAT entries
-    all_data += struct.pack('<I', len(fat_entries))
-    for cluster, fat_val in fat_entries:
+    # Directory entries
+    all_data += struct.pack('<I', len(analysis['directory_entries']))
+    for offset, entry_data in analysis['directory_entries']:
+        all_data += struct.pack('<I', offset)
+        all_data += entry_data  # 64 bytes
+    
+    # FAT16 entries
+    all_data += struct.pack('<I', len(analysis['fat16_entries']))
+    for cluster, fat_val in analysis['fat16_entries']:
         all_data += struct.pack('<HH', cluster, fat_val)
     
+    # FAT32 entries
+    all_data += struct.pack('<I', len(analysis['fat32_entries']))
+    for cluster, offset, entry_data in analysis['fat32_entries']:
+        all_data += struct.pack('<II', cluster, offset)
+        all_data += entry_data  # 4 bytes
+    
     # Data chunks
-    all_data += struct.pack('<I', len(data_chunks))
-    for cluster, offset, chunk_data in data_chunks:
+    all_data += struct.pack('<I', len(analysis['data_chunks']))
+    for cluster, offset, chunk_data in analysis['data_chunks']:
         all_data += struct.pack('<II', cluster, offset)
         all_data += struct.pack('<I', len(chunk_data))
         all_data += chunk_data
     
-    # Extra areas
-    all_data += struct.pack('<I', len(extra_areas))
-    for offset, area_data in extra_areas:
-        all_data += struct.pack('<I', offset)
-        all_data += struct.pack('<I', len(area_data))
-        all_data += area_data
+    # Salva
+    backup_dir = Path(BACKUP_DIR)
+    backup_dir.mkdir(parents=True, exist_ok=True)
     
-    # FAT32 entries (NUOVO in v3 - calcolato dinamicamente!)
-    all_data += struct.pack('<I', len(fat32_entries))
-    for cluster, offset, entry_data in fat32_entries:
-        all_data += struct.pack('<II', cluster, offset)
-        all_data += entry_data  # 4 bytes
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = backup_dir / f"{game_id}_dynamic_{timestamp}.bin"
+    metadata_file = backup_dir / f"{game_id}_dynamic_{timestamp}.json"
     
     with open(backup_file, 'wb') as f:
         f.write(all_data)
     
-    # Metadata JSON
+    # Metadata
     metadata = {
         "format": "XBSV",
-        "version": 3,
+        "version": 4,
         "game_id": game_id,
-        "game_name": game['name'],
+        "game_name": analysis['game_name'],
         "backup_date": datetime.now().isoformat(),
         "source_hdd": str(HDD_SOURCE),
-        "dir_entry_offset": game['dir_entry_offset'],
-        "first_cluster": game['first_cluster'],
-        "fat_chain_length": len(fat_chain),
-        "fat_chain": fat_chain[:100],  # Primi 100 per debug
-        "data_clusters": len(data_chunks),
-        "extra_areas": len(extra_areas),
-        "fat32_entries": len(fat32_entries),
+        "total_clusters": len(analysis['all_clusters']),
+        "directory_entries": len(analysis['directory_entries']),
+        "fat16_entries": len(analysis['fat16_entries']),
+        "fat32_entries": len(analysis['fat32_entries']),
+        "data_chunks": len(analysis['data_chunks']),
         "total_size": len(all_data),
         "data_hash": hashlib.md5(all_data).hexdigest(),
     }
@@ -264,32 +354,32 @@ def backup_single_game(game_id: str) -> Tuple[str, str]:
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"\n✅ Backup completato!")
-    print(f"   File: {backup_file.name}")
-    print(f"   Size: {len(all_data):,} bytes ({len(all_data) // 1024} KB)")
-    print(f"   Metadata: {metadata_file.name}")
+    print(f"\nBackup completato!")
+    print(f"  File: {backup_file.name}")
+    print(f"  Size: {len(all_data):,} bytes ({len(all_data) // 1024:,} KB)")
+    print(f"  Metadata: {metadata_file.name}")
     
     return str(backup_file), str(metadata_file)
 
 # =============================================================================
-# RESTORE SINGOLO GIOCO (MERGE CHIRURGICO)
+# RESTORE DINAMICO
 # =============================================================================
 
-def restore_single_game(backup_file: str, metadata_file: str) -> bool:
+def restore_single_game_v4(backup_file: str, metadata_file: str) -> bool:
     """
-    Ripristina un singolo gioco con MERGE chirurgico.
-    NON sovrascrive le aree degli altri giochi!
+    Ripristina un gioco da backup v4 (dinamico).
     """
-    print("=" * 70)
-    print("💉 RESTORE CHIRURGICO (MERGE)")
+    print("\n" + "=" * 70)
+    print("RESTORE DINAMICO v4")
     print("=" * 70)
     
     # Leggi metadata
     with open(metadata_file, 'r') as f:
         metadata = json.load(f)
     
-    print(f"\n🎮 Gioco: {metadata['game_name']} ({metadata['game_id']})")
-    print(f"📅 Backup: {metadata['backup_date']}")
+    print(f"\nGioco: {metadata['game_name']} ({metadata['game_id']})")
+    print(f"Backup: {metadata['backup_date']}")
+    print(f"Versione formato: {metadata['version']}")
     
     # Leggi backup
     with open(backup_file, 'rb') as f:
@@ -298,40 +388,65 @@ def restore_single_game(backup_file: str, metadata_file: str) -> bool:
     # Verifica hash
     actual_hash = hashlib.md5(backup_data).hexdigest()
     if actual_hash != metadata['data_hash']:
-        print("❌ Hash non corrisponde! Backup corrotto?")
+        print("ERRORE: Hash non corrisponde! Backup corrotto?")
         return False
-    print("✅ Hash verificato")
+    print("Hash verificato OK")
     
-    # Parsa backup
+    # Parse backup
     pos = 0
     
     # Header
     magic = backup_data[pos:pos + 4]
     pos += 4
     if magic != b"XBSV":
-        print(f"❌ Magic non valido: {magic}")
+        print(f"ERRORE: Magic non valido: {magic}")
         return False
     
     version = struct.unpack('<I', backup_data[pos:pos + 4])[0]
     pos += 4
-    print(f"   Versione formato: {version}")
     
-    # Directory entry
-    dir_entry_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-    pos += 4
-    dir_entry = backup_data[pos:pos + dir_entry_size]
-    pos += dir_entry_size
-    print(f"   Directory entry: {dir_entry_size} bytes")
+    if version < 4:
+        print(f"ERRORE: Versione {version} non supportata (richiesta >= 4)")
+        return False
     
-    # FAT entries
-    fat_entries_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    # Game ID
+    game_id = backup_data[pos:pos + 8].decode('ascii').rstrip('\x00')
+    pos += 8
+    print(f"Game ID: {game_id}")
+    
+    # Directory entries
+    dir_entries_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
     pos += 4
-    fat_entries = []
-    for _ in range(fat_entries_count):
-        cluster, fat_val = struct.unpack('<HH', backup_data[pos:pos + 4])
-        fat_entries.append((cluster, fat_val))
+    dir_entries = []
+    for _ in range(dir_entries_count):
+        offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
         pos += 4
-    print(f"   FAT entries: {fat_entries_count}")
+        entry_data = backup_data[pos:pos + 64]
+        pos += 64
+        dir_entries.append((offset, entry_data))
+    print(f"Directory entries: {len(dir_entries)}")
+    
+    # FAT16 entries
+    fat16_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat16_entries = []
+    for _ in range(fat16_count):
+        cluster, fat_val = struct.unpack('<HH', backup_data[pos:pos + 4])
+        pos += 4
+        fat16_entries.append((cluster, fat_val))
+    print(f"FAT16 entries: {len(fat16_entries)}")
+    
+    # FAT32 entries
+    fat32_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat32_entries = []
+    for _ in range(fat32_count):
+        cluster, offset = struct.unpack('<II', backup_data[pos:pos + 8])
+        pos += 8
+        entry_data = backup_data[pos:pos + 4]
+        pos += 4
+        fat32_entries.append((cluster, offset, entry_data))
+    print(f"FAT32 entries: {len(fat32_entries)}")
     
     # Data chunks
     data_chunks_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
@@ -345,183 +460,174 @@ def restore_single_game(backup_file: str, metadata_file: str) -> bool:
         chunk_data = backup_data[pos:pos + chunk_size]
         pos += chunk_size
         data_chunks.append((cluster, offset, chunk_data))
-    print(f"   Data clusters: {data_chunks_count}")
+    print(f"Data chunks: {len(data_chunks)}")
     
-    # Extra areas
-    extra_areas_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-    pos += 4
-    extra_areas = []
-    for _ in range(extra_areas_count):
-        offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-        pos += 4
-        area_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-        pos += 4
-        area_data = backup_data[pos:pos + area_size]
-        pos += area_size
-        extra_areas.append((offset, area_data))
-    print(f"   Extra areas: {extra_areas_count}")
-    
-    # FAT32 entries (versione 3) o metadata_areas (versione 2)
-    fat32_entries = []
-    legacy_metadata_areas = []  # Per V2
-    
-    if version >= 3:
-        fat32_entries_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-        pos += 4
-        for _ in range(fat32_entries_count):
-            cluster, offset = struct.unpack('<II', backup_data[pos:pos + 8])
-            pos += 8
-            entry_data = backup_data[pos:pos + 4]
-            pos += 4
-            fat32_entries.append((cluster, offset, entry_data))
-        print(f"   FAT32 entries: {fat32_entries_count} (dinamico)")
-    elif version >= 2:
-        # Compatibilità con versione 2 (hardcoded) - USA LISTA SEPARATA!
-        metadata_areas_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-        pos += 4
-        for _ in range(metadata_areas_count):
-            offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-            pos += 4
-            area_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
-            pos += 4
-            area_data = backup_data[pos:pos + area_size]
-            pos += area_size
-            # Mantieni TUTTI i dati, non troncare a 4 bytes!
-            legacy_metadata_areas.append((offset, area_size, area_data))
-        print(f"   Metadata areas (legacy v2): {metadata_areas_count}")
-    
-    # --- MERGE CHIRURGICO ---
-    print(f"\n🔧 MERGE CHIRURGICO in {Path(HDD_TARGET).name}")
+    # === SCRIVI SU HDD TARGET ===
+    print(f"\nScrittura su: {Path(HDD_TARGET).name}")
     
     with open(HDD_TARGET, 'r+b') as f:
         
-        # 1. Scrivi directory entry
-        print(f"\n   1. Directory entry @ 0x{metadata['dir_entry_offset']:08x}")
-        f.seek(metadata['dir_entry_offset'])
-        f.write(dir_entry)
+        # 1. Directory entries
+        print("\n  [1/4] Directory entries...")
+        for offset, entry_data in dir_entries:
+            f.seek(offset)
+            f.write(entry_data)
+        print(f"        Scritte {len(dir_entries)} entries")
         
-        # 2. Scrivi FAT16 entries (MERGE: solo queste, non toccare le altre!)
-        print(f"\n   2. FAT16 entries ({len(fat_entries)} entries)")
-        for cluster, fat_val in fat_entries:
+        # 2. FAT16 entries
+        print("  [2/4] FAT16 entries...")
+        for cluster, fat_val in fat16_entries:
             fat_offset = FAT_TABLE_OFFSET + (cluster * 2)
             f.seek(fat_offset)
             f.write(struct.pack('<H', fat_val))
-        print(f"      Scritte {len(fat_entries)} FAT16 entries")
+        print(f"        Scritte {len(fat16_entries)} entries")
         
-        # 3. Scrivi data clusters
-        print(f"\n   3. Data clusters ({len(data_chunks)} chunks)")
+        # 3. FAT32 entries
+        print("  [3/4] FAT32 entries...")
+        for cluster, offset, entry_data in fat32_entries:
+            f.seek(offset)
+            f.write(entry_data)
+        print(f"        Scritte {len(fat32_entries)} entries")
+        
+        # 4. Data chunks
+        print("  [4/4] Data chunks...")
         for cluster, offset, chunk_data in data_chunks:
             f.seek(offset)
             f.write(chunk_data)
         total_data = sum(len(c[2]) for c in data_chunks)
-        print(f"      Scritti {total_data:,} bytes di dati")
+        print(f"        Scritti {total_data:,} bytes")
         
-        # 4. Scrivi extra areas
-        if extra_areas:
-            print(f"\n   4. Extra areas ({len(extra_areas)} aree)")
-            for offset, area_data in extra_areas:
-                f.seek(offset)
-                f.write(area_data)
-                print(f"      0x{offset:08x}: {len(area_data)} bytes")
-        
-        # 5. Scrivi FAT32 entries (V3) o legacy metadata areas (V2)
-        if fat32_entries:
-            print(f"\n   5. FAT32 entries ({len(fat32_entries)} entries) 🔑")
-            written = 0
-            for cluster, offset, entry_data in fat32_entries:
-                f.seek(offset)
-                f.write(entry_data)
-                written += 1
-            print(f"      Scritte {written} FAT32 entries")
-        
-        # 5b. Scrivi legacy metadata areas (V2) - CRITICO!
-        if legacy_metadata_areas:
-            print(f"\n   5. Legacy metadata areas ({len(legacy_metadata_areas)} aree) 🔑")
-            for offset, size, area_data in legacy_metadata_areas:
-                f.seek(offset)
-                f.write(area_data)
-                print(f"      0x{offset:08x}: {size} bytes")
-        
-        # Forza scrittura
+        # Flush
         f.flush()
         os.fsync(f.fileno())
     
-    print(f"\n✅ RESTORE CHIRURGICO COMPLETATO!")
-    print(f"   Gli altri giochi NON sono stati toccati.")
-    print(f"\n🎮 Ora puoi avviare xemu e verificare!")
+    print("\n" + "=" * 70)
+    print("RESTORE COMPLETATO!")
+    print("=" * 70)
+    print("Gli altri giochi NON sono stati toccati.")
+    print("Ora puoi testare con xemu!")
     
     return True
+
+# =============================================================================
+# LISTA GIOCHI DISPONIBILI
+# =============================================================================
+
+def list_available_games() -> List[Dict]:
+    """
+    Scansiona l'HDD sorgente e ritorna i giochi disponibili.
+    """
+    print(f"\nScansione: {Path(HDD_SOURCE).name}")
+    
+    with open(HDD_SOURCE, 'rb') as f:
+        data = f.read()
+    
+    # Scan UDATA (cluster 4)
+    udata_entries = scan_directory(data, 4)
+    
+    games = []
+    for e in udata_entries:
+        # Game ID sono stringhe hex di 8 caratteri
+        if len(e['filename']) == 8:
+            try:
+                int(e['filename'], 16)  # Verifica che sia hex
+                game_id = e['filename'].lower()
+                games.append({
+                    'id': game_id,
+                    'name': GAME_NAMES.get(game_id, f"Unknown ({game_id})"),
+                    'first_cluster': e['first_cluster'],
+                    'entry_offset': e['offset'],
+                })
+            except ValueError:
+                pass
+    
+    return games
+
+def list_backups() -> List[Path]:
+    """Lista i backup disponibili."""
+    backup_dir = Path(BACKUP_DIR)
+    if not backup_dir.exists():
+        return []
+    
+    return sorted(backup_dir.glob("*_dynamic_*.json"), reverse=True)
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def list_surgical_backups():
-    """Lista i backup chirurgici disponibili."""
-    backup_dir = Path(BACKUP_DIR)
-    if not backup_dir.exists():
-        print("❌ Nessun backup trovato")
-        return []
-    
-    backups = list(backup_dir.glob("*_surgical_*.json"))
-    
-    print("\n📋 BACKUP CHIRURGICI DISPONIBILI:")
-    for i, meta_file in enumerate(backups):
-        with open(meta_file) as f:
-            meta = json.load(f)
-        print(f"  {i+1}. {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']}")
-    
-    return backups
-
 def main():
     print("=" * 70)
-    print("🎮 SINGLE GAME MERGER - Backup/Restore Chirurgico")
+    print("SINGLE GAME MERGER v4 - Backup/Restore DINAMICO")
     print("=" * 70)
     
     while True:
-        print("\n📋 MENU:")
-        print("1. 📦 Backup chirurgico singolo gioco")
-        print("2. 💉 Restore chirurgico (merge)")
-        print("3. 📋 Lista backup disponibili")
-        print("4. 🔧 Restore TUTTO (metodo classico)")
-        print("0. ❌ Esci")
+        print("\nMENU:")
+        print("1. Lista giochi disponibili")
+        print("2. Backup dinamico singolo gioco")
+        print("3. Restore dinamico")
+        print("4. Lista backup disponibili")
+        print("0. Esci")
         
         choice = input("\nScelta: ").strip()
         
         if choice == "1":
-            print("\nGiochi disponibili:")
-            for gid, info in GAMES.items():
-                print(f"  {gid}: {info['name']}")
-            game_id = input("ID gioco da backuppare: ").strip().lower()
-            if game_id in GAMES:
-                backup_single_game(game_id)
-            else:
-                print("❌ ID non valido")
+            games = list_available_games()
+            print(f"\nGiochi trovati: {len(games)}")
+            for g in games:
+                print(f"  {g['id']}: {g['name']} (cluster {g['first_cluster']})")
         
         elif choice == "2":
-            backups = list_surgical_backups()
-            if backups:
-                try:
-                    idx = int(input("Numero backup da ripristinare: ")) - 1
-                    if 0 <= idx < len(backups):
-                        meta_file = backups[idx]
-                        bin_file = meta_file.with_suffix('.bin')
-                        restore_single_game(str(bin_file), str(meta_file))
-                    else:
-                        print("❌ Numero non valido")
-                except ValueError:
-                    print("❌ Input non valido")
+            games = list_available_games()
+            if not games:
+                print("Nessun gioco trovato!")
+                continue
+            
+            print("\nGiochi disponibili:")
+            for i, g in enumerate(games):
+                print(f"  {i+1}. {g['id']}: {g['name']}")
+            
+            try:
+                idx = int(input("Numero gioco: ")) - 1
+                if 0 <= idx < len(games):
+                    backup_single_game_v4(games[idx]['id'])
+                else:
+                    print("Numero non valido")
+            except ValueError:
+                print("Input non valido")
         
         elif choice == "3":
-            list_surgical_backups()
+            backups = list_backups()
+            if not backups:
+                print("Nessun backup trovato!")
+                continue
+            
+            print("\nBackup disponibili:")
+            for i, b in enumerate(backups):
+                with open(b) as f:
+                    meta = json.load(f)
+                print(f"  {i+1}. {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']}")
+            
+            try:
+                idx = int(input("Numero backup: ")) - 1
+                if 0 <= idx < len(backups):
+                    meta_file = backups[idx]
+                    bin_file = meta_file.with_suffix('.bin')
+                    restore_single_game_v4(str(bin_file), str(meta_file))
+                else:
+                    print("Numero non valido")
+            except ValueError:
+                print("Input non valido")
         
         elif choice == "4":
-            # Importa il vecchio metodo
-            try:
-                from restore_filesystem_areas import restore_filesystem_areas
-                restore_filesystem_areas()
-            except ImportError:
-                print("❌ Script restore_filesystem_areas.py non trovato")
+            backups = list_backups()
+            print(f"\nBackup trovati: {len(backups)}")
+            for b in backups:
+                try:
+                    with open(b) as f:
+                        meta = json.load(f)
+                    print(f"  {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']} - v{meta['version']}")
+                except:
+                    print(f"  {b.name} (errore lettura)")
         
         elif choice == "0":
             break
