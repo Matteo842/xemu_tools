@@ -1,8 +1,10 @@
 # 🎮 Xbox Save Surgical Restore Tool
 
-## 🏆 Project Status: WORKING!
+## 🏆 Project Status: WORKING! (v5 - FAT Range)
 
 **Single-game backup and restore for Xbox saves on xemu emulator** - A tool that can backup and restore individual game saves without affecting other games on the same virtual HDD.
+
+**Latest Update:** v5 with FAT Range - Now works with ALL tested games including Halo 2!
 
 ---
 
@@ -37,6 +39,7 @@ The Xbox FATX filesystem has:
 - **Shared directory structures** (UDATA, TDATA folders)
 - **Interleaved data** (games can use non-contiguous clusters)
 - **Critical metadata** that must be restored alongside data
+- **Collateral clusters** that get modified when deleting saves (discovered in v5!)
 
 ---
 
@@ -45,15 +48,16 @@ The Xbox FATX filesystem has:
 We developed a **surgical backup/restore system** that:
 
 1. **Identifies** exactly which clusters belong to a specific game
-2. **Extracts** only those clusters + their FAT entries + critical metadata
+2. **Extracts** only those clusters + a FAT RANGE with safety margin
 3. **Restores** ONLY those areas, leaving other games untouched
 
-### Proven Results
+### Proven Results (v5 - January 2026)
 
 | Test Case | Result |
 |-----------|--------|
 | Restore Mercenaries with ToeJam deleted | ✅ Mercenaries works, ToeJam stays deleted |
 | Restore Mercenaries with ToeJam present | ✅ Both games work |
+| **Restore Halo 2 with other games deleted** | ✅ **Halo 2 works, others stay deleted** |
 | Data integrity after restore | ✅ Saves load and play correctly |
 
 ---

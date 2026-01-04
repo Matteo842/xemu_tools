@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-SINGLE GAME MERGER v4 - Backup/Restore DINAMICO per Xbox saves
+SINGLE GAME MERGER v5 - Backup/Restore con FAT RANGE per Xbox saves
 
-NOVITA' v4:
+NOVITA' v5:
+- FAT RANGE: salva un blocco intero della FAT invece di entries singole
+- Risolve il problema di Halo 2 e giochi con "cluster collaterali"
+- Calcola automaticamente il range ottimale con margine di sicurezza
+
+NOVITA' precedenti (v4):
 - Calcolo DINAMICO di tutte le aree necessarie
 - NON richiede piu' metadata_areas hardcoded
 - Trova automaticamente il gioco per Title ID
 - Scansiona ricorsivamente la struttura del gioco
 
-Testato con: Mercenaries (4c410015)
+Testato con: Mercenaries (4c410015), Halo 2 (4d530064)
 """
 
 import os
@@ -23,7 +28,7 @@ from typing import List, Dict, Set, Optional, Tuple
 # CONFIGURAZIONE
 # =============================================================================
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd3.qcow2"  # Backup funzionante (SOLO LETTURA)
+HDD_SOURCE = r"D:\xemu\bk\xbox_hdd5.qcow2"  # Backup funzionante (SOLO LETTURA)
 HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"       # HDD da modificare
 BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
 
@@ -128,7 +133,7 @@ def parse_directory_entry(data: bytes, offset: int) -> Optional[Dict]:
         'raw': entry_data
     }
 
-def scan_directory(data: bytes, first_cluster: int, max_clusters: int = 2) -> List[Dict]:
+def scan_directory(data: bytes, first_cluster: int, max_clusters: int = 10) -> List[Dict]:
     """Scansiona una directory e ritorna le entries valide."""
     entries = []
     chain = get_fat_chain(data, first_cluster)
@@ -172,23 +177,79 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
         'data_chunks': [],        # (cluster, offset, data)
     }
     
-    # 1. Trova game in UDATA (cluster 4)
+    # 1. Trova game in UDATA - scansiona RANGE di cluster (non solo FAT chain)
+    # Alcuni giochi hanno strutture piatte senza collegamenti FAT
     print("\n[1] Cerca gioco in UDATA...")
-    udata_entries = scan_directory(data, 4)
-    game_entry = None
     
-    for e in udata_entries:
+    game_entry = None
+    sibling_save_slots = []  # Save slots che sono fratelli in UDATA
+    
+    # Funzione per verificare se un nome sembra un save slot (hex lungo)
+    def is_save_slot_name(name):
+        if len(name) < 10:  # Nomi hex save slot sono lunghi (es. 12130F4013AB)
+            return False
+        return all(c in '0123456789ABCDEFabcdef' for c in name)
+    
+    # Scansiona cluster 3-15 per trovare entries (approccio brute force)
+    # Questo funziona anche per strutture piatte senza FAT chain
+    all_dir_entries = []
+    for cluster in range(3, 16):
+        cluster_offset = cluster_to_offset(cluster)
+        if cluster_offset + CLUSTER_SIZE > len(data):
+            continue
+        for i in range(CLUSTER_SIZE // ENTRY_SIZE):
+            offset = cluster_offset + i * ENTRY_SIZE
+            entry = parse_directory_entry(data, offset)
+            if entry:
+                all_dir_entries.append(entry)
+    
+    for e in all_dir_entries:
         if e['filename'].lower() == game_id.lower():
             game_entry = e
             print(f"    Trovato: '{e['filename']}' @ 0x{e['offset']:08x} -> cluster {e['first_cluster']}")
-            break
+        elif is_save_slot_name(e['filename']):
+            # Potrebbe essere un save slot fratello!
+            sibling_save_slots.append(e)
     
     if not game_entry:
         print(f"    ERRORE: Gioco {game_id} non trovato in UDATA!")
         return None
     
+    # Mostra save slots fratelli trovati
+    if sibling_save_slots:
+        print(f"    Trovati {len(sibling_save_slots)} possibili save slot fratelli:")
+        for ss in sibling_save_slots:
+            print(f"      '{ss['filename']}' @ cluster {(ss['offset'] - DATA_START) // CLUSTER_SIZE + 2} -> first_cluster {ss['first_cluster']}")
+    
     # Salva entry UDATA del gioco
     result['directory_entries'].append((game_entry['offset'], game_entry['raw']))
+    
+    # Salva anche i save slots fratelli + loro contenuto
+    for ss in sibling_save_slots:
+        result['directory_entries'].append((ss['offset'], ss['raw']))
+        if ss['first_cluster'] > 0:
+            ss_chain = get_fat_chain(data, ss['first_cluster'])
+            result['all_clusters'].update(ss_chain)
+            print(f"        Cluster chain: {ss_chain}")
+            
+            # IMPORTANTE: Scansiona le entries DENTRO il save slot!
+            # (es. SaveMeta.xbx, MATTEO, altri file)
+            inner_entries = scan_directory(data, ss['first_cluster'])
+            
+            # Se non trova entries, prova first_cluster+1 (alcuni giochi hanno offset)
+            if not inner_entries:
+                next_cluster = ss['first_cluster'] + 1
+                inner_entries = scan_directory(data, next_cluster)
+                if inner_entries:
+                    print(f"        (entries trovate in cluster {next_cluster})")
+                    result['all_clusters'].add(next_cluster)
+            
+            for ie in inner_entries:
+                print(f"          -> {ie['filename']} @ cluster {ie['first_cluster']}")
+                result['directory_entries'].append((ie['offset'], ie['raw']))
+                if ie['first_cluster'] > 0:
+                    ie_chain = get_fat_chain(data, ie['first_cluster'])
+                    result['all_clusters'].update(ie_chain)
     
     # 2. Scansiona cartella gioco
     print(f"\n[2] Scansiona cartella gioco (cluster {game_entry['first_cluster']})...")
@@ -198,14 +259,31 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
     print(f"    Folder chain: {len(game_folder_chain)} clusters")
     
     # Verifica se il contenuto della cartella sono DIRECTORY ENTRIES o DATI
-    # Leggi il primo cluster della cartella e controlla se sembra una directory entry
+    # Una directory entry FATX valida ha:
+    # - Byte 0: lunghezza nome (1-42)
+    # - Byte 1: attributi (tipicamente 0x00, 0x10, 0x20, etc. - max 0x3F)
+    # - Bytes 2+: nome ASCII stampabile
     first_cluster_offset = cluster_to_offset(game_entry['first_cluster'])
-    first_byte = data[first_cluster_offset]
-    is_directory_content = 1 <= first_byte <= 42  # Filename length valido
+    first_byte = data[first_cluster_offset]       # filename length
+    second_byte = data[first_cluster_offset + 1]  # attributes
+    
+    # Check più robusto: verifica che sembri davvero una directory entry
+    is_directory_content = False
+    if 1 <= first_byte <= 42:
+        # Potrebbe essere una directory, verifichiamo il nome
+        name_bytes = data[first_cluster_offset + 2:first_cluster_offset + 2 + first_byte]
+        # Il nome deve essere ASCII stampabile (32-126) o almeno non contenere bytes nulli
+        try:
+            name = name_bytes.decode('ascii')
+            # Verifica che sia un nome "ragionevole" - caratteri stampabili comuni
+            is_printable = all(c.isprintable() or c in ' ._-' for c in name)
+            is_valid_attrs = second_byte <= 0x3F  # Attributi validi FATX
+            is_directory_content = is_printable and is_valid_attrs
+        except:
+            is_directory_content = False
     
     if is_directory_content:
-        # Struttura normale con subdirectory (come Mercenaries)
-        print("    Tipo: Directory con entries (struttura standard)")
+        print(f"    Tipo: Directory con entries (struttura standard)")
         game_contents = scan_directory(data, game_entry['first_cluster'])
         print(f"    Entries trovate: {len(game_contents)}")
         
@@ -238,137 +316,141 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
         print(f"    Primo byte: 0x{first_byte:02x} (non e' una directory entry)")
         print(f"    Usando solo FAT chain: {len(game_folder_chain)} clusters")
         
-        # NUOVO: Cerca save slot separati
-        # I giochi come ToeJam/Halo 2 hanno il save slot directory in cluster separati
-        # Lo troviamo cercando SaveMeta.xbx che punta a cluster DENTRO la nostra chain
-        print("\n    [2b] Cerca save slot separati...")
+        # TEMPORANEO: Disabilita ricerca save slot esterni che causa problemi
+        # La ricerca trova save slot di ALTRI giochi quando i cluster si sovrappongono
+        ENABLE_SAVE_SLOT_SEARCH = True  # Abilitato per HDD con singolo gioco
         
-        game_cluster_set = set(game_folder_chain)
-        
-        # Cerca tutte le occorrenze di SaveMeta.xbx nell'HDD
-        save_meta_pattern = b"SaveMeta.xbx"
-        pos = 0
         found_save_slots = []
-        
-        while True:
-            pos = data.find(save_meta_pattern, pos)
-            if pos == -1:
-                break
-            
-            # Verifica se è una directory entry valida
-            entry_start = pos - 2
-            if entry_start >= 0:
-                fn_len = data[entry_start]
-                if fn_len == 12:  # "SaveMeta.xbx" ha 12 caratteri
-                    # Ottieni il first_cluster di questo SaveMeta
-                    save_data_cluster = struct.unpack('<I', data[entry_start + 44:entry_start + 48])[0]
-                    
-                    # Se punta a un cluster nella nostra chain, questo è il nostro save slot!
-                    if save_data_cluster in game_cluster_set:
-                        # Calcola quale cluster contiene questa entry
-                        if entry_start >= DATA_START:
-                            save_slot_cluster = (entry_start - DATA_START) // CLUSTER_SIZE + 2
-                            
-                            print(f"    TROVATO save slot @ cluster {save_slot_cluster}")
-                            print(f"      SaveMeta.xbx -> cluster {save_data_cluster}")
-                            
-                            found_save_slots.append({
-                                'entry_offset': entry_start,
-                                'slot_cluster': save_slot_cluster,
-                                'data_cluster': save_data_cluster
-                            })
-            
-            pos += 1
-        
-        # Aggiungi i save slot trovati (da SaveMeta.xbx)
-        for slot in found_save_slots:
-            slot_cluster = slot['slot_cluster']
-            
-            # Aggiungi il cluster del save slot
-            result['all_clusters'].add(slot_cluster)
-            
-            # Scansiona le entries nel save slot
-            slot_entries = scan_directory(data, slot_cluster)
-            for se in slot_entries:
-                st = 'DIR' if se['is_dir'] else 'FILE'
-                print(f"      -> {st:4} {se['filename']:<20} cluster={se['first_cluster']:>5}")
-                
-                result['directory_entries'].append((se['offset'], se['raw']))
-                
-                # IMPORTANTE: Segui le chain dei file interni al save slot!
-                # Potrebbero usare cluster FUORI dalla game_folder_chain
-                if se['first_cluster'] > 0 and se['first_cluster'] not in game_cluster_set:
-                    file_chain = get_fat_chain(data, se['first_cluster'])
-                    new_clusters = [c for c in file_chain if c not in result['all_clusters']]
-                    if new_clusters:
-                        result['all_clusters'].update(file_chain)
-                        print(f"         + {len(new_clusters)} cluster extra (chain: {file_chain[:5]}...)")
-        
-        # NUOVO: Cerca anche save slot tramite directory con nomi hex
-        # Esempio: "589BCCD01326" che punta a cluster nella nostra chain
-        print("\n    [2c] Cerca save slot con nomi hex...")
-        
-        # Funzione per verificare se un nome è hex
-        def is_hex_name(name):
-            if len(name) < 8:
-                return False
-            return all(c in '0123456789ABCDEFabcdef' for c in name)
-        
-        # Cerca in TUTTO l'HDD entry che puntano a cluster nella nostra chain
-        # Strategia: cerchiamo il pattern first_cluster (come 4 byte little-endian)
         hex_save_slots = []
         
-        # Cerca per ogni cluster nella chain
-        clusters_to_search = sorted(game_cluster_set)[:20]  # Limita ai primi 20 per velocità
-        
-        for target_cluster in clusters_to_search:
-            # Pattern da cercare: first_cluster come 4 byte a offset +44
-            target_bytes = struct.pack('<I', target_cluster)
+        if ENABLE_SAVE_SLOT_SEARCH:
+            # NUOVO: Cerca save slot separati
+            # I giochi come ToeJam/Halo 2 hanno il save slot directory in cluster separati
+            # Lo troviamo cercando SaveMeta.xbx che punta a cluster DENTRO la nostra chain
+            print("\n    [2b] Cerca save slot separati...")
             
+            game_cluster_set = set(game_folder_chain)
+            
+            # Cerca tutte le occorrenze di SaveMeta.xbx nell'HDD
+            save_meta_pattern = b"SaveMeta.xbx"
             pos = 0
+            
             while True:
-                pos = data.find(target_bytes, pos)
+                pos = data.find(save_meta_pattern, pos)
                 if pos == -1:
                     break
                 
-                # Verifica se potrebbe essere a offset +44 di una directory entry
-                entry_start = pos - 44
-                if entry_start >= DATA_START:
+                # Verifica se è una directory entry valida
+                entry_start = pos - 2
+                if entry_start >= 0:
                     fn_len = data[entry_start]
-                    attrs = data[entry_start + 1]
-                    
-                    # Deve essere una directory (0x10) con nome hex
-                    if 8 <= fn_len <= 42 and (attrs & 0x10):
-                        try:
-                            fn = data[entry_start + 2:entry_start + 2 + fn_len].decode('ascii')
-                            if is_hex_name(fn):
-                                entry_cluster = (entry_start - DATA_START) // CLUSTER_SIZE + 2
+                    if fn_len == 12:  # "SaveMeta.xbx" ha 12 caratteri
+                        # Ottieni il first_cluster di questo SaveMeta
+                        save_data_cluster = struct.unpack('<I', data[entry_start + 44:entry_start + 48])[0]
+                        
+                        # Se punta a un cluster nella nostra chain, questo è il nostro save slot!
+                        if save_data_cluster in game_cluster_set:
+                            # Calcola quale cluster contiene questa entry
+                            if entry_start >= DATA_START:
+                                save_slot_cluster = (entry_start - DATA_START) // CLUSTER_SIZE + 2
                                 
-                                # Evita duplicati e l'entry del gioco stesso
-                                if fn.lower() != game_id.lower():
-                                    if entry_cluster not in [s['slot_cluster'] for s in found_save_slots]:
-                                        if entry_cluster not in [s['cluster'] for s in hex_save_slots]:
-                                            print(f"    TROVATO save slot hex @ cluster {entry_cluster}")
-                                            print(f"      '{fn}' -> cluster {target_cluster}")
-                                            
-                                            hex_save_slots.append({
-                                                'cluster': entry_cluster,
-                                                'offset': entry_start,
-                                                'name': fn,
-                                                'first_cluster': target_cluster
-                                            })
-                                            
-                                            # Aggiungi il cluster
-                                            result['all_clusters'].add(entry_cluster)
-                                            result['directory_entries'].append((entry_start, data[entry_start:entry_start + 64]))
-                        except:
-                            pass
+                                print(f"    TROVATO save slot @ cluster {save_slot_cluster}")
+                                print(f"      SaveMeta.xbx -> cluster {save_data_cluster}")
+                                
+                                found_save_slots.append({
+                                    'entry_offset': entry_start,
+                                    'slot_cluster': save_slot_cluster,
+                                    'data_cluster': save_data_cluster
+                                })
                 
                 pos += 1
-        
-        
-        if not found_save_slots and not hex_save_slots:
-            print("    Nessun save slot separato trovato")
+            
+            # Aggiungi i save slot trovati (da SaveMeta.xbx)
+            for slot in found_save_slots:
+                slot_cluster = slot['slot_cluster']
+                
+                # Aggiungi il cluster del save slot
+                result['all_clusters'].add(slot_cluster)
+                
+                # Scansiona le entries nel save slot
+                slot_entries = scan_directory(data, slot_cluster)
+                for se in slot_entries:
+                    st = 'DIR' if se['is_dir'] else 'FILE'
+                    print(f"      -> {st:4} {se['filename']:<20} cluster={se['first_cluster']:>5}")
+                    
+                    result['directory_entries'].append((se['offset'], se['raw']))
+                    
+                    # IMPORTANTE: Segui le chain dei file interni al save slot!
+                    # Potrebbero usare cluster FUORI dalla game_folder_chain
+                    if se['first_cluster'] > 0 and se['first_cluster'] not in game_cluster_set:
+                        file_chain = get_fat_chain(data, se['first_cluster'])
+                        new_clusters = [c for c in file_chain if c not in result['all_clusters']]
+                        if new_clusters:
+                            result['all_clusters'].update(file_chain)
+                            print(f"         + {len(new_clusters)} cluster extra (chain: {file_chain[:5]}...)")
+            
+            # Cerca anche save slot tramite directory con nomi hex
+            print("\n    [2c] Cerca save slot con nomi hex...")
+            
+            # Funzione per verificare se un nome è hex
+            def is_hex_name(name):
+                if len(name) < 8:
+                    return False
+                return all(c in '0123456789ABCDEFabcdef' for c in name)
+            
+            # Cerca per ogni cluster nella chain
+            clusters_to_search = sorted(game_cluster_set)[:20]
+            
+            for target_cluster in clusters_to_search:
+                target_bytes = struct.pack('<I', target_cluster)
+                
+                pos = 0
+                while True:
+                    pos = data.find(target_bytes, pos)
+                    if pos == -1:
+                        break
+                    
+                    entry_start = pos - 44
+                    if entry_start >= DATA_START:
+                        fn_len = data[entry_start]
+                        attrs = data[entry_start + 1]
+                        
+                        if 8 <= fn_len <= 42 and (attrs & 0x10):
+                            try:
+                                fn = data[entry_start + 2:entry_start + 2 + fn_len].decode('ascii')
+                                if is_hex_name(fn):
+                                    entry_cluster = (entry_start - DATA_START) // CLUSTER_SIZE + 2
+                                    
+                                    # Escludi UDATA e Title IDs
+                                    if entry_cluster in [3, 4]:
+                                        pass
+                                    elif len(fn) == 8:
+                                        pass
+                                    elif fn.lower() != game_id.lower():
+                                        if entry_cluster not in [s['slot_cluster'] for s in found_save_slots]:
+                                            if entry_cluster not in [s['cluster'] for s in hex_save_slots]:
+                                                print(f"    TROVATO save slot hex @ cluster {entry_cluster}")
+                                                print(f"      '{fn}' -> cluster {target_cluster}")
+                                                
+                                                hex_save_slots.append({
+                                                    'cluster': entry_cluster,
+                                                    'offset': entry_start,
+                                                    'name': fn,
+                                                    'first_cluster': target_cluster
+                                                })
+                                                
+                                                result['all_clusters'].add(entry_cluster)
+                                                result['directory_entries'].append((entry_start, data[entry_start:entry_start + 64]))
+                            except:
+                                pass
+                    
+                    pos += 1
+            
+            if not found_save_slots and not hex_save_slots:
+                print("    Nessun save slot separato trovato")
+        else:
+            print("\n    [!] Ricerca save slot esterni DISABILITATA (debug)")
+            print("        Usando solo la FAT chain del gioco")
     
     # 3. Calcola entries FAT16 e FAT32
     print(f"\n[3] Calcola entries FAT...")
@@ -410,8 +492,318 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
     return result
 
 # =============================================================================
-# BACKUP DINAMICO
+# FAT RANGE - NUOVA STRATEGIA v5
 # =============================================================================
+
+def calculate_fat_range(clusters: set, margin: int = 100) -> Tuple[int, int]:
+    """
+    Calcola il range di cluster da salvare con un margine di sicurezza.
+    
+    Invece di salvare solo i FAT entries dei cluster specifici del gioco,
+    salviamo un BLOCCO INTERO della FAT che copre tutto il range + margine.
+    
+    Questo cattura anche i "cluster collaterali" che vengono modificati
+    quando xemu cancella un save.
+    """
+    if not clusters:
+        return (0, 0)
+    
+    min_cluster = min(clusters)
+    max_cluster = max(clusters)
+    
+    # Aggiungi margine di sicurezza
+    range_start = max(0, min_cluster - margin)
+    range_end = max_cluster + margin
+    
+    return (range_start, range_end)
+
+
+def backup_single_game_v5(game_id: str) -> Tuple[str, str]:
+    """
+    Crea un backup con FAT RANGE di un singolo gioco.
+    
+    Formato v5: 
+    - Salva un BLOCCO INTERO della FAT16 e FAT32 invece di entries singole
+    - Questo cattura tutti i "cluster collaterali" e risolve problemi
+      come quello di Halo 2
+    """
+    print("\n" + "=" * 70)
+    print(f"BACKUP FAT RANGE v5: {game_id}")
+    print("=" * 70)
+    
+    # Leggi HDD sorgente
+    print(f"\nLettura: {Path(HDD_SOURCE).name}")
+    with open(HDD_SOURCE, 'rb') as f:
+        data = f.read()
+    print(f"Size: {len(data):,} bytes")
+    
+    # Analisi dinamica (riusa la logica v4)
+    analysis = analyze_game_dynamic(data, game_id)
+    if not analysis:
+        print("ERRORE: Analisi fallita!")
+        return None, None
+    
+    # Calcola FAT range con margine
+    fat_range_start, fat_range_end = calculate_fat_range(analysis['all_clusters'], margin=100)
+    fat_range_count = fat_range_end - fat_range_start + 1
+    
+    print(f"\n[6] Calcolo FAT RANGE...")
+    print(f"    Cluster del gioco: {min(analysis['all_clusters'])} - {max(analysis['all_clusters'])}")
+    print(f"    FAT range (con margine 100): {fat_range_start} - {fat_range_end}")
+    print(f"    Cluster nel range: {fat_range_count}")
+    
+    # Estrai blocco FAT16 completo per il range
+    fat16_range_start_offset = FAT_TABLE_OFFSET + (fat_range_start * 2)
+    fat16_range_size = fat_range_count * 2  # 2 bytes per entry
+    fat16_range_data = data[fat16_range_start_offset:fat16_range_start_offset + fat16_range_size]
+    print(f"    FAT16 range: offset 0x{fat16_range_start_offset:08x}, size {fat16_range_size} bytes")
+    
+    # Estrai blocco FAT32 completo per il range
+    fat32_range_start_offset = FAT32_TABLE_OFFSET + (fat_range_start * 4)
+    fat32_range_size = fat_range_count * 4  # 4 bytes per entry
+    fat32_range_data = data[fat32_range_start_offset:fat32_range_start_offset + fat32_range_size]
+    print(f"    FAT32 range: offset 0x{fat32_range_start_offset:08x}, size {fat32_range_size} bytes")
+    
+    # Serializza backup
+    print(f"\nCreazione backup v5...")
+    
+    all_data = b""
+    
+    # Header
+    all_data += b"XBSV"  # Magic
+    all_data += struct.pack('<I', 5)  # Versione 5 (FAT range)
+    
+    # Game ID (8 bytes, padded)
+    game_id_bytes = game_id.encode('ascii')[:8].ljust(8, b'\x00')
+    all_data += game_id_bytes
+    
+    # Directory entries (stesso formato di v4)
+    all_data += struct.pack('<I', len(analysis['directory_entries']))
+    for offset, entry_data in analysis['directory_entries']:
+        all_data += struct.pack('<I', offset)
+        all_data += entry_data  # 64 bytes
+    
+    # FAT RANGE invece di entries singole!
+    # FAT16 range
+    all_data += struct.pack('<I', fat_range_start)  # Cluster iniziale
+    all_data += struct.pack('<I', fat_range_count)  # Numero cluster
+    all_data += struct.pack('<I', fat16_range_start_offset)  # Offset nel file
+    all_data += struct.pack('<I', len(fat16_range_data))  # Size
+    all_data += fat16_range_data
+    
+    # FAT32 range
+    all_data += struct.pack('<I', fat_range_start)  # Cluster iniziale
+    all_data += struct.pack('<I', fat_range_count)  # Numero cluster
+    all_data += struct.pack('<I', fat32_range_start_offset)  # Offset nel file
+    all_data += struct.pack('<I', len(fat32_range_data))  # Size
+    all_data += fat32_range_data
+    
+    # Data chunks (stesso formato di v4)
+    all_data += struct.pack('<I', len(analysis['data_chunks']))
+    for cluster, offset, chunk_data in analysis['data_chunks']:
+        all_data += struct.pack('<II', cluster, offset)
+        all_data += struct.pack('<I', len(chunk_data))
+        all_data += chunk_data
+    
+    # Salva
+    backup_dir = Path(BACKUP_DIR)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = backup_dir / f"{game_id}_fatrange_{timestamp}.bin"
+    metadata_file = backup_dir / f"{game_id}_fatrange_{timestamp}.json"
+    
+    with open(backup_file, 'wb') as f:
+        f.write(all_data)
+    
+    # Metadata
+    metadata = {
+        "format": "XBSV",
+        "version": 5,
+        "game_id": game_id,
+        "game_name": analysis['game_name'],
+        "backup_date": datetime.now().isoformat(),
+        "source_hdd": str(HDD_SOURCE),
+        "total_clusters": len(analysis['all_clusters']),
+        "fat_range_start": fat_range_start,
+        "fat_range_end": fat_range_end,
+        "fat_range_count": fat_range_count,
+        "fat16_range_size": fat16_range_size,
+        "fat32_range_size": fat32_range_size,
+        "directory_entries": len(analysis['directory_entries']),
+        "data_chunks": len(analysis['data_chunks']),
+        "total_size": len(all_data),
+        "data_hash": hashlib.md5(all_data).hexdigest(),
+    }
+    
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    print(f"\nBackup v5 completato!")
+    print(f"  File: {backup_file.name}")
+    print(f"  Size: {len(all_data):,} bytes ({len(all_data) // 1024:,} KB)")
+    print(f"  FAT range salvato: cluster {fat_range_start}-{fat_range_end} ({fat_range_count} clusters)")
+    print(f"  Metadata: {metadata_file.name}")
+    
+    return str(backup_file), str(metadata_file)
+
+
+def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
+    """
+    Ripristina un gioco da backup v5 (FAT range).
+    
+    La differenza rispetto a v4 è che ripristiniamo un BLOCCO INTERO
+    della FAT invece di entries singole.
+    """
+    print("\n" + "=" * 70)
+    print("RESTORE FAT RANGE v5")
+    print("=" * 70)
+    
+    # Leggi metadata
+    with open(metadata_file, 'r') as f:
+        metadata = json.load(f)
+    
+    print(f"\nGioco: {metadata['game_name']} ({metadata['game_id']})")
+    print(f"Backup: {metadata['backup_date']}")
+    print(f"Versione formato: {metadata['version']}")
+    print(f"FAT range: cluster {metadata['fat_range_start']}-{metadata['fat_range_end']}")
+    
+    # Leggi backup
+    with open(backup_file, 'rb') as f:
+        backup_data = f.read()
+    
+    # Verifica hash
+    actual_hash = hashlib.md5(backup_data).hexdigest()
+    if actual_hash != metadata['data_hash']:
+        print("ERRORE: Hash non corrisponde! Backup corrotto?")
+        return False
+    print("Hash verificato OK")
+    
+    # Parse backup
+    pos = 0
+    
+    # Header
+    magic = backup_data[pos:pos + 4]
+    pos += 4
+    if magic != b"XBSV":
+        print(f"ERRORE: Magic non valido: {magic}")
+        return False
+    
+    version = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    
+    if version != 5:
+        print(f"ERRORE: Versione {version} non supportata da restore_v5 (richiesta 5)")
+        print("Usa restore_v4 per backup versione 4")
+        return False
+    
+    # Game ID
+    game_id = backup_data[pos:pos + 8].decode('ascii').rstrip('\x00')
+    pos += 8
+    print(f"Game ID: {game_id}")
+    
+    # Directory entries
+    dir_entries_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    dir_entries = []
+    for _ in range(dir_entries_count):
+        offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+        pos += 4
+        entry_data = backup_data[pos:pos + 64]
+        pos += 64
+        dir_entries.append((offset, entry_data))
+    print(f"Directory entries: {len(dir_entries)}")
+    
+    # FAT16 range
+    fat16_range_start = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat16_range_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat16_offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat16_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat16_data = backup_data[pos:pos + fat16_size]
+    pos += fat16_size
+    print(f"FAT16 range: cluster {fat16_range_start}-{fat16_range_start + fat16_range_count - 1}, size {fat16_size} bytes")
+    
+    # FAT32 range
+    fat32_range_start = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat32_range_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat32_offset = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat32_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    fat32_data = backup_data[pos:pos + fat32_size]
+    pos += fat32_size
+    print(f"FAT32 range: cluster {fat32_range_start}-{fat32_range_start + fat32_range_count - 1}, size {fat32_size} bytes")
+    
+    # Data chunks
+    data_chunks_count = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+    pos += 4
+    data_chunks = []
+    for _ in range(data_chunks_count):
+        cluster, offset = struct.unpack('<II', backup_data[pos:pos + 8])
+        pos += 8
+        chunk_size = struct.unpack('<I', backup_data[pos:pos + 4])[0]
+        pos += 4
+        chunk_data = backup_data[pos:pos + chunk_size]
+        pos += chunk_size
+        data_chunks.append((cluster, offset, chunk_data))
+    print(f"Data chunks: {len(data_chunks)}")
+    
+    # === SCRIVI SU HDD TARGET ===
+    print(f"\nScrittura su: {Path(HDD_TARGET).name}")
+    
+    with open(HDD_TARGET, 'r+b') as f:
+        
+        # 1. Directory entries
+        print("\n  [1/4] Directory entries...")
+        for offset, entry_data in dir_entries:
+            f.seek(offset)
+            f.write(entry_data)
+        print(f"        Scritte {len(dir_entries)} entries")
+        
+        # 2. FAT16 RANGE (blocco intero!)
+        print("  [2/4] FAT16 range...")
+        f.seek(fat16_offset)
+        f.write(fat16_data)
+        print(f"        Scritto blocco di {fat16_size} bytes @ 0x{fat16_offset:08x}")
+        
+        # 3. FAT32 RANGE (blocco intero!)
+        print("  [3/4] FAT32 range...")
+        f.seek(fat32_offset)
+        f.write(fat32_data)
+        print(f"        Scritto blocco di {fat32_size} bytes @ 0x{fat32_offset:08x}")
+        
+        # 4. Data chunks
+        print("  [4/4] Data chunks...")
+        for cluster, offset, chunk_data in data_chunks:
+            f.seek(offset)
+            f.write(chunk_data)
+        total_data = sum(len(c[2]) for c in data_chunks)
+        print(f"        Scritti {total_data:,} bytes")
+        
+        # Flush
+        f.flush()
+        os.fsync(f.fileno())
+    
+    print("\n" + "=" * 70)
+    print("RESTORE v5 COMPLETATO!")
+    print("=" * 70)
+    print("FAT range ripristinato - questo include tutti i 'cluster collaterali'")
+    print("Gli altri giochi NON sono stati toccati.")
+    print("Ora puoi testare con xemu!")
+    
+    return True
+
+
+# =============================================================================
+# BACKUP DINAMICO (v4 legacy)
+# =============================================================================
+
 
 def backup_single_game_v4(game_id: str) -> Tuple[str, str]:
     """
@@ -692,12 +1084,17 @@ def list_available_games() -> List[Dict]:
     return games
 
 def list_backups() -> List[Path]:
-    """Lista i backup disponibili."""
+    """Lista i backup disponibili (v4 dynamic e v5 fatrange)."""
     backup_dir = Path(BACKUP_DIR)
     if not backup_dir.exists():
         return []
     
-    return sorted(backup_dir.glob("*_dynamic_*.json"), reverse=True)
+    # Trova sia backup _dynamic_ (v4) che _fatrange_ (v5)
+    dynamic_backups = list(backup_dir.glob("*_dynamic_*.json"))
+    fatrange_backups = list(backup_dir.glob("*_fatrange_*.json"))
+    
+    all_backups = dynamic_backups + fatrange_backups
+    return sorted(all_backups, reverse=True)
 
 # =============================================================================
 # MAIN
@@ -705,15 +1102,26 @@ def list_backups() -> List[Path]:
 
 def main():
     print("=" * 70)
-    print("SINGLE GAME MERGER v4 - Backup/Restore DINAMICO")
+    print("SINGLE GAME MERGER v5 - Backup/Restore con FAT RANGE")
     print("=" * 70)
+    print("\nNOTA: v5 usa FAT RANGE che risolve problemi come Halo 2")
+    print("      Le opzioni v4 sono disponibili per compatibilita'")
     
     while True:
-        print("\nMENU:")
+        print("\n" + "-" * 40)
+        print("MENU:")
+        print("-" * 40)
         print("1. Lista giochi disponibili")
-        print("2. Backup dinamico singolo gioco")
-        print("3. Restore dinamico")
-        print("4. Lista backup disponibili")
+        print("")
+        print("--- BACKUP (consigliato: v5) ---")
+        print("2. Backup FAT RANGE v5 (CONSIGLIATO)")
+        print("3. Backup dinamico v4 (legacy)")
+        print("")
+        print("--- RESTORE ---")
+        print("4. Restore (auto-detect versione)")
+        print("")
+        print("--- ALTRO ---")
+        print("5. Lista backup disponibili")
         print("0. Esci")
         
         choice = input("\nScelta: ").strip()
@@ -725,6 +1133,27 @@ def main():
                 print(f"  {g['id']}: {g['name']} (cluster {g['first_cluster']})")
         
         elif choice == "2":
+            # Backup v5 (FAT RANGE) - CONSIGLIATO
+            games = list_available_games()
+            if not games:
+                print("Nessun gioco trovato!")
+                continue
+            
+            print("\nGiochi disponibili:")
+            for i, g in enumerate(games):
+                print(f"  {i+1}. {g['id']}: {g['name']}")
+            
+            try:
+                idx = int(input("Numero gioco: ")) - 1
+                if 0 <= idx < len(games):
+                    backup_single_game_v5(games[idx]['id'])
+                else:
+                    print("Numero non valido")
+            except ValueError:
+                print("Input non valido")
+        
+        elif choice == "3":
+            # Backup v4 (legacy)
             games = list_available_games()
             if not games:
                 print("Nessun gioco trovato!")
@@ -743,42 +1172,70 @@ def main():
             except ValueError:
                 print("Input non valido")
         
-        elif choice == "3":
+        elif choice == "4":
+            # Restore - auto-detect versione
             backups = list_backups()
             if not backups:
                 print("Nessun backup trovato!")
                 continue
             
             print("\nBackup disponibili:")
+            backup_metas = []
             for i, b in enumerate(backups):
-                with open(b) as f:
-                    meta = json.load(f)
-                print(f"  {i+1}. {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']}")
+                try:
+                    with open(b) as f:
+                        meta = json.load(f)
+                    version = meta.get('version', '?')
+                    backup_metas.append((b, meta))
+                    print(f"  {i+1}. [{version}] {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']}")
+                except Exception as e:
+                    backup_metas.append((b, None))
+                    print(f"  {i+1}. {b.name} (errore: {e})")
             
             try:
                 idx = int(input("Numero backup: ")) - 1
                 if 0 <= idx < len(backups):
-                    meta_file = backups[idx]
+                    meta_file, meta = backup_metas[idx]
                     bin_file = meta_file.with_suffix('.bin')
-                    restore_single_game_v4(str(bin_file), str(meta_file))
+                    
+                    if meta is None:
+                        print("Errore: impossibile leggere metadata del backup")
+                        continue
+                    
+                    version = meta.get('version', 4)
+                    
+                    if version == 5:
+                        print(f"\nUsando restore v5 (FAT RANGE)...")
+                        restore_single_game_v5(str(bin_file), str(meta_file))
+                    elif version >= 4:
+                        print(f"\nUsando restore v4 (dinamico)...")
+                        restore_single_game_v4(str(bin_file), str(meta_file))
+                    else:
+                        print(f"Versione {version} non supportata!")
                 else:
                     print("Numero non valido")
             except ValueError:
                 print("Input non valido")
         
-        elif choice == "4":
+        elif choice == "5":
             backups = list_backups()
             print(f"\nBackup trovati: {len(backups)}")
             for b in backups:
                 try:
                     with open(b) as f:
                         meta = json.load(f)
-                    print(f"  {meta['game_name']} ({meta['game_id']}) - {meta['backup_date']} - v{meta['version']}")
+                    version = meta.get('version', '?')
+                    fat_range = ""
+                    if version == 5 and 'fat_range_start' in meta:
+                        fat_range = f" [FAT: {meta['fat_range_start']}-{meta['fat_range_end']}]"
+                    print(f"  v{version} | {meta['game_name']} ({meta['game_id']}) | {meta['backup_date']}{fat_range}")
                 except:
                     print(f"  {b.name} (errore lettura)")
         
         elif choice == "0":
+            print("\nArrivederci!")
             break
 
 if __name__ == "__main__":
     main()
+

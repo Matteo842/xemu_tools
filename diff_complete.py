@@ -3,7 +3,7 @@
 DIFF COMPLETA - Trova TUTTE le differenze tra source e target
 """
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd3.qcow2"
+HDD_SOURCE = r"D:\xemu\bk\xbox_hdd4.qcow2"
 HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"
 
 print("=" * 70)
