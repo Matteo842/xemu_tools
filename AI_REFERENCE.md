@@ -1,193 +1,131 @@
-# 🔧 Technical Reference for AI Assistants
+# 🎮 AI Reference - Xbox Save Surgical Restore
 
-**This document is specifically designed for future AI chat sessions working on this project.**
+**Documento di riferimento per AI e sviluppatori futuri**
 
----
-
-## 🎯 Quick Context
-
-**Project:** Xbox Save Surgical Restore for xemu emulator
-**Status:** WORKING (Version 2 format)
-**Main File:** `single_game_merger.py`
+**Status Progetto:** ✅ PRODUCTION READY (v5.1)  
+**Ultimo aggiornamento:** 4 Gennaio 2026
 
 ---
 
-## ✅ What Works
+## 📋 Quick Reference
 
-The **Version 2 (V2) backup format** with **hardcoded metadata_areas** works perfectly:
+### File Principale
+```
+single_game_merger.py  →  Script principale backup/restore
+```
 
+### Costanti Critiche
 ```python
-# In GAMES config:
-"4c410015": {
-    "name": "Mercenaries",
-    "dir_entry_offset": 0x00447000,
-    "first_cluster": 4,
-    "metadata_areas": [
-        (0x0031102c, 112, "Directory_Metadata_Mercenaries"),
-        (0x00463040, 64, "SaveEntry_Mercenaries"),
-    ],
-}
+FAT16_OFFSET = 0x00161000      # Tabella FAT primaria
+FAT32_OFFSET = 0x00311000      # Tabella FAT secondaria
+DATA_START = 0x00443000        # Inizio dati cluster
+CLUSTER_SIZE = 16384           # 16KB per cluster
+ENTRY_SIZE = 64                # Dimensione directory entry
 ```
 
----
-
-## ❌ What Does NOT Work
-
-**Version 3 (V3) dynamic FAT32 calculation** - The concept was wrong.
-
-We tried to calculate FAT32 offsets from the game's cluster chain:
+### Formule
 ```python
-# WRONG APPROACH:
-fat32_offset = FAT32_TABLE_OFFSET + (cluster * 4)
-```
-
-This didn't work because:
-- The game FOLDER uses clusters 4, 5, 6, 3225...
-- But the SAVE FILES inside use clusters 11-38
-- We were calculating offsets for the folder, not the saves
-
-**Do NOT attempt dynamic calculation again without first parsing the directory structure to find save file clusters.**
-
----
-
-## 🔑 Critical Memory Points
-
-### 1. There Are TWO FAT Tables
-
-| Table | Offset | Format | Purpose |
-|-------|--------|--------|---------|
-| FAT16 | 0x161000 | 2 bytes/entry | Primary allocation |
-| FAT32 | 0x311000 | 4 bytes/entry | Secondary/extended allocation |
-
-**BOTH must be restored for saves to work!**
-
-### 2. The metadata_areas Are NOT What They Seem
-
-The bytes at 0x31102C are NOT FAT32 entries for the game's main cluster chain.
-They appear to be allocation data for the SAVE FILES inside the game folder.
-
-### 3. Cluster to Offset Formula
-
-```python
-DATA_START = 0x00443000
-CLUSTER_SIZE = 16384  # 16KB
-
-def cluster_to_offset(cluster):
-    return DATA_START + ((cluster - 2) * CLUSTER_SIZE)
-```
-
-### 4. Game Cluster Chains (Non-Overlapping!)
-
-- **Mercenaries:** 4 → 5 → 6 → 3225 → ... → 6110 (2886 clusters)
-- **ToeJam:** 39 → 40 → ... → 146 (108 clusters)
-
-Games don't share clusters! This makes surgical restore possible.
-
----
-
-## 📝 How to Add a New Game
-
-1. **Have both games on HDD** (working backup)
-2. **Delete ONLY the new game's save** in xemu
-3. **Run comparison:**
-   ```python
-   # Use analyze_diff_details.py or similar
-   # Compare SOURCE (both games) vs TARGET (one deleted)
-   ```
-4. **Note the differences** in:
-   - `Directory_Metadata` (0x300000-0x320000)
-   - `Save_Area_Complete` (0x440000-0x470000)
-5. **Add to GAMES config:**
-   ```python
-   "new_game_id": {
-       "name": "New Game Name",
-       "dir_entry_offset": 0x00447XXX,  # From analysis
-       "first_cluster": XX,              # From FAT chain
-       "metadata_areas": [
-           (0x0031XXXX, size, "Description"),
-           # Add all areas that changed
-       ],
-   }
-   ```
-
----
-
-## 🗂️ Important File Locations
-
-| Purpose | Path |
-|---------|------|
-| Main script | `single_game_merger.py` |
-| Working backup | `D:\xemu\bk\xbox_hdd2.qcow2` |
-| Target HDD | `D:\xemu\xbox_hdd.qcow2` |
-| Surgical backups | `surgical_backups/` |
-| Title ID database | `xbox_title_id_map.json` |
-
----
-
-## 🔄 Backup Format (V2)
-
-```
-XBSV (magic, 4 bytes)
-Version (uint32)
-Directory Entry Length (uint32)
-Directory Entry Data (variable)
-FAT Entries Count (uint32)
-FAT Entries [(cluster, value) * count]
-Data Chunks Count (uint32)
-Data Chunks [(cluster, offset, size, data) * count]
-Extra Areas Count (uint32)
-Extra Areas [(offset, size, data) * count]
-Metadata Areas Count (uint32)  <-- V2 ONLY
-Metadata Areas [(offset, size, data) * count]
+cluster_to_offset = lambda c: DATA_START + ((c - 2) * CLUSTER_SIZE)
+read_fat16 = lambda data, c: struct.unpack('<H', data[FAT16_OFFSET + c*2:][:2])[0]
 ```
 
 ---
 
-## ⚠️ Common Mistakes to Avoid
+## 🎯 Cosa Funziona
 
-1. **Don't truncate metadata_areas** - They need FULL data, not just 4 bytes
-2. **Don't skip FAT32 table** - Restoring only FAT16 causes "damaged" errors
-3. **Don't use V3 dynamic calculation** - It's based on wrong assumptions
-4. **Always verify with both games** - Test that non-target game is untouched
-
----
-
-## 🧪 Testing Procedure
-
-1. Copy working backup to target: `xbox_hdd2.qcow2` → `xbox_hdd.qcow2`
-2. Delete ONLY target game's save in xemu
-3. Run restore command
-4. Verify target game works
-5. Verify OTHER game was NOT affected (should show "no saves" if it was deleted)
+| Versione | Giochi Supportati | Note |
+|----------|-------------------|------|
+| v5/v5.1 | Mercenaries, Halo 2, NFS Underground 2 | Approccio dinamico |
+| Custom | ToeJam & Earl III | Richiede hardcoding |
 
 ---
 
-## 📊 Session Statistics
+## ⚠️ Cosa NON Fare
 
-- **Analysis scripts created:** 10+
-- **Backup format versions:** 3 (only V2 works correctly)
-- **Hours spent:** Many (including 5 AM debugging sessions)
-- **Final solution:** Hardcoded metadata_areas per game
-
----
-
-## 💡 Future Improvement Ideas
-
-1. **Parse directory structure** to find save file clusters automatically
-2. **Build metadata_areas dynamically** based on save file analysis
-3. **Create game profile database** with known working offsets
-4. **GUI integration** with SaveState
+1. **NON modificare FAT_TABLE_OFFSET** senza ricalcolare tutto
+2. **NON saltare il backup FAT32** - è critico quanto FAT16
+3. **NON assumere che tutti i giochi abbiano la stessa struttura**
+4. **NON usare v3/v4** - sono obsolete, usa sempre v5+
 
 ---
 
-## 🆘 If Restore Fails
+## 🔧 Troubleshooting
 
-1. Check if backup was created with V2 format
-2. Verify metadata_areas are being written (check log for "Legacy metadata areas")
-3. Ensure BOTH 112-byte and 64-byte areas are written for Mercenaries
-4. Try restoring from original backup (`restore_filesystem_areas.py`) to reset
+### "Save non trovato dopo restore"
+1. Esegui `python diff_complete.py`
+2. Verifica se ci sono bytes diversi in aree non coperte
+3. Estendi la scansione cluster o aggiungi aree hardcoded
+
+### "Hash non corrisponde"
+- Il file backup è corrotto, ricrealo
+
+### "Gioco si carica ma save è vuoto"
+- Mancano directory entries del save slot interno
+- Verifica che `scan_directory` trovi le entries
 
 ---
 
-*Document created: January 3, 2026*
-*Last working test: Mercenaries restore with ToeJam preservation*
+## 📚 Documentazione Estesa
+
+- `AI_REFERENCE_SESSION2.md` - Scoperta problema Halo 2, analisi FAT chain
+- `AI_REFERENCE_SESSION3.md` - Soluzione v5, test finali, fix v5.1
+
+---
+
+## 🏗️ Architettura
+
+```
+analyze_game_dynamic()
+    ├── scan cluster 3-15 per entries
+    ├── trova game folder
+    ├── trova sibling save slots (nomi hex)
+    ├── scansiona contenuto save slots
+    │   └── fallback cluster+1 se vuoto
+    ├── segue FAT chain
+    └── calcola FAT range con margine
+
+backup_single_game_v5()
+    ├── chiama analyze_game_dynamic()
+    ├── serializza directory entries
+    ├── copia FAT16/FAT32 range
+    ├── copia data chunks
+    └── salva con hash MD5
+
+restore_single_game_v5()
+    ├── verifica hash
+    ├── ripristina directory entries
+    ├── ripristina FAT16/FAT32 range
+    └── ripristina data chunks
+```
+
+---
+
+## 📊 Strutture Gioco Incontrate
+
+### Tipo 1: Standard (Mercenaries)
+```
+UDATA/4c410015/
+    └── subdirectory con SaveMeta.xbx
+```
+
+### Tipo 2: Dati Diretti (Halo 2)
+```
+UDATA/4d530064/  → contiene dati, non directory entries
+Save slot in cluster separato (27127)
+```
+
+### Tipo 3: Sibling Slots (NFS Underground 2)
+```
+UDATA/4541005a/  → contiene dati
+12130F4013AB/    → save slot come sibling (non figlio!)
+```
+
+### Tipo 4: Anomalo (ToeJam)
+```
+Save slot a cluster 17710+ (lontanissimo)
+Richiede diff e hardcoding
+```
+
+---
+
+*Generato automaticamente - Non modificare manualmente*
