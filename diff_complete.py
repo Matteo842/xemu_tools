@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
 DIFF COMPLETA - Trova TUTTE le differenze tra source e target
+Output salvato su file per evitare overflow console
 """
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd4.qcow2"
-HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"
+HDD_SOURCE = r"D:\xemu\bk\xbox_hddb1.qcow2"  # Checkpoint 1
+HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"  # Checkpoint 2
+OUTPUT_FILE = r"D:\GitHub\xemu_tools\diff_output.txt"
+
+# Area dati FATX inizia qui
+DATA_START = 0x00430000
+CLUSTER_SIZE = 16384
 
 print("=" * 70)
-print("DIFF COMPLETA HDD")
+print("DIFF COMPLETA HDD5 vs HDD6")
 print("=" * 70)
 
 print("\nCaricamento...")
@@ -28,38 +34,87 @@ for i in range(min(len(source), len(target))):
 
 print(f"\nTOTALE BYTES DIVERSI: {len(all_diffs):,}")
 
-if len(all_diffs) == 0:
-    print("\nI file sono IDENTICI!")
-else:
-    # Raggruppa per aree da 64KB
-    areas = {}
-    for pos in all_diffs:
-        area = (pos // 0x10000) * 0x10000
-        if area not in areas:
-            areas[area] = []
-        areas[area].append(pos)
+with open(OUTPUT_FILE, 'w') as out:
+    out.write(f"DIFF HDD5 vs HDD6\n")
+    out.write(f"Source: {HDD_SOURCE}\n")
+    out.write(f"Target: {HDD_TARGET}\n")
+    out.write(f"Bytes diversi: {len(all_diffs):,}\n\n")
     
-    print(f"AREE DIVERSE: {len(areas)}")
-    
-    print("\n" + "=" * 70)
-    print("DETTAGLIO AREE")
-    print("=" * 70)
-    
-    for area in sorted(areas.keys()):
-        diffs = areas[area]
-        first = min(diffs)
-        last = max(diffs)
+    if len(all_diffs) == 0:
+        out.write("I file sono IDENTICI!\n")
+        print("I file sono IDENTICI!")
+    else:
+        # Separa differenze pre-data (header/FAT) e data area
+        pre_data_diffs = [pos for pos in all_diffs if pos < DATA_START]
+        data_diffs = [pos for pos in all_diffs if pos >= DATA_START]
         
-        # Contesto
-        ctx = source[first:first+32]
-        ascii_ctx = ''.join(chr(c) if 32 <= c < 127 else '.' for c in ctx)
+        # Mostra differenze pre-data (header/FAT)
+        if pre_data_diffs:
+            out.write(f"=== DIFFERENZE PRE-DATA (Header/FAT) ===\n")
+            out.write(f"Area: 0x00000000 - 0x{DATA_START:08x}\n")
+            out.write(f"Bytes diversi: {len(pre_data_diffs)}\n\n")
+            
+            # Raggruppa per area
+            areas = {}
+            for pos in pre_data_diffs:
+                area_name = "Unknown"
+                if pos < 0x1000:
+                    area_name = "Header"
+                elif pos < 0x001A1000:
+                    area_name = "Pre-FAT"
+                elif pos < 0x001B3000:
+                    area_name = "FAT Area"
+                else:
+                    area_name = "Post-FAT"
+                
+                if area_name not in areas:
+                    areas[area_name] = []
+                areas[area_name].append(pos)
+            
+            for area_name, positions in sorted(areas.items()):
+                out.write(f"\n{area_name}: {len(positions)} bytes\n")
+                for pos in positions[:10]:  # Primi 10
+                    s = source[pos]
+                    t = target[pos]
+                    out.write(f"  0x{pos:08x}: src=0x{s:02x} tgt=0x{t:02x}\n")
+                if len(positions) > 10:
+                    out.write(f"  ... e altri {len(positions) - 10}\n")
+            
+            print(f"Differenze pre-data: {len(pre_data_diffs)} bytes")
         
-        print(f"\n0x{area:08x}: {len(diffs):,} bytes diversi")
-        print(f"  Range: 0x{first:08x} - 0x{last:08x}")
-        print(f"  Contesto source: \"{ascii_ctx[:40]}\"")
+        # Raggruppa per cluster (16KB)
+        clusters_changed = {}
+        for pos in data_diffs:
+            cluster = (pos - DATA_START) // CLUSTER_SIZE + 1  # 1-indexed per HDD nuovi
+            if cluster not in clusters_changed:
+                clusters_changed[cluster] = []
+            clusters_changed[cluster].append(pos)
         
-        # Prime 3 differenze
-        for pos in diffs[:3]:
-            s = source[pos]
-            t = target[pos]
-            print(f"  0x{pos:08x}: src=0x{s:02x} tgt=0x{t:02x}")
+        if clusters_changed:
+            out.write(f"\n=== DIFFERENZE DATA AREA ===\n")
+            out.write(f"CLUSTER MODIFICATI: {len(clusters_changed)}\n")
+            out.write(f"Range: {min(clusters_changed.keys())} - {max(clusters_changed.keys())}\n\n")
+            
+            # Mostra dettagli per ogni cluster
+            for cluster in sorted(clusters_changed.keys())[:100]:  # Primi 100 cluster
+                diffs = clusters_changed[cluster]
+                cluster_offset = DATA_START + (cluster - 1) * CLUSTER_SIZE
+                
+                out.write(f"\nCluster {cluster} (offset 0x{cluster_offset:08x}): {len(diffs)} bytes diversi\n")
+                
+                # Primi 5 byte diversi
+                for pos in diffs[:5]:
+                    s = source[pos]
+                    t = target[pos]
+                    out.write(f"  0x{pos:08x}: src=0x{s:02x} tgt=0x{t:02x}\n")
+            
+            if len(clusters_changed) > 100:
+                out.write(f"\n... e altri {len(clusters_changed) - 100} cluster\n")
+            
+            print(f"Cluster modificati: {len(clusters_changed)}")
+            print(f"Range: {min(clusters_changed.keys())} - {max(clusters_changed.keys())}")
+        else:
+            print("Nessun cluster data modificato (tutte le differenze sono in header/FAT)")
+        
+        print(f"\nOutput salvato in: {OUTPUT_FILE}")
+

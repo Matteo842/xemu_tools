@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-SINGLE GAME MERGER v5 - Backup/Restore con FAT RANGE per Xbox saves
+SINGLE GAME MERGER v5.2 - Backup/Restore con FAT RANGE per Xbox saves
+
+NOVITA' v5.2:
+- RILEVAMENTO AUTOMATICO tipo HDD (piccolo vs 8GB)
+- FIX cluster non linkati via FAT (es. Black)
+- Estensione automatica range cluster allocati
 
 NOVITA' v5:
 - FAT RANGE: salva un blocco intero della FAT invece di entries singole
@@ -13,7 +18,7 @@ NOVITA' precedenti (v4):
 - Trova automaticamente il gioco per Title ID
 - Scansiona ricorsivamente la struttura del gioco
 
-Testato con: Mercenaries (4c410015), Halo 2 (4d530064)
+Testato con: Mercenaries (4c410015), Halo 2 (4d530064), Black (45410083)
 """
 
 import os
@@ -28,16 +33,17 @@ from typing import List, Dict, Set, Optional, Tuple
 # CONFIGURAZIONE
 # =============================================================================
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd5.qcow2"  # Backup funzionante (SOLO LETTURA)
-HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"       # HDD da modificare
+HDD_SOURCE = r"D:\xemu\bk\xbox_hdd5.qcow2"  # Checkpoint 1 (backup)
+HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"        # HDD da modificare (copiare h2 qui prima del test)
 BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
 
-# Struttura Xbox FATX
-FAT_TABLE_OFFSET = 0x00161000   # FAT16 Table
-FAT32_TABLE_OFFSET = 0x00311000 # FAT32 Table
-CLUSTER_SIZE = 16384            # 16KB
-DATA_START = 0x00443000         # Inizio area dati
-ENTRY_SIZE = 64                 # Directory entry size
+# Costanti globali - verranno impostate da detect_hdd_type()
+FAT_TABLE_OFFSET = 0
+FAT32_TABLE_OFFSET = 0
+DATA_START = 0
+CLUSTER_INDEX_BASE = 1  # 1 per HDD piccoli, 2 per HDD 8GB
+CLUSTER_SIZE = 16384    # 16KB (costante)
+ENTRY_SIZE = 64         # Directory entry size (costante)
 
 # Database nomi giochi (opzionale, per visualizzazione)
 GAME_NAMES = {
@@ -45,7 +51,56 @@ GAME_NAMES = {
     "5345000f": "ToeJam & Earl III",
     "4d530064": "Halo 2",
     "4541005a": "NFS Underground 2",
+    "45410083": "Black",
 }
+
+def detect_hdd_type(data: bytes) -> str:
+    """
+    Rileva automaticamente il tipo di HDD basandosi su:
+    1. Dimensione del file
+    2. Posizione della signature FATX
+    
+    Ritorna: 'small' o '8gb'
+    """
+    global FAT_TABLE_OFFSET, FAT32_TABLE_OFFSET, DATA_START, CLUSTER_INDEX_BASE
+    
+    file_size = len(data)
+    
+    # Cerca signature FATX in posizioni note
+    # HDD piccoli: FATX @ 0x001A0000
+    # HDD 8GB: FATX @ 0x00160000
+    
+    fatx_small = data[0x001A0000:0x001A0004] if len(data) > 0x001A0004 else b''
+    fatx_8gb = data[0x00160000:0x00160004] if len(data) > 0x00160004 else b''
+    
+    if fatx_small == b'FATX':
+        # HDD piccolo (tipo nuovo xemu)
+        FAT_TABLE_OFFSET = 0x001A1000
+        FAT32_TABLE_OFFSET = 0x001A1000
+        DATA_START = 0x001B3000
+        CLUSTER_INDEX_BASE = 1
+        return 'small'
+    elif fatx_8gb == b'FATX':
+        # HDD 8GB originale
+        FAT_TABLE_OFFSET = 0x00161000
+        FAT32_TABLE_OFFSET = 0x00311000
+        DATA_START = 0x00443000
+        CLUSTER_INDEX_BASE = 2
+        return '8gb'
+    else:
+        # Fallback basato sulla dimensione
+        if file_size < 100_000_000:  # < 100MB
+            FAT_TABLE_OFFSET = 0x001A1000
+            FAT32_TABLE_OFFSET = 0x001A1000
+            DATA_START = 0x001B3000
+            CLUSTER_INDEX_BASE = 1
+            return 'small'
+        else:
+            FAT_TABLE_OFFSET = 0x00161000
+            FAT32_TABLE_OFFSET = 0x00311000
+            DATA_START = 0x00443000
+            CLUSTER_INDEX_BASE = 2
+            return '8gb'
 
 # =============================================================================
 # FUNZIONI FAT
@@ -90,7 +145,9 @@ def get_fat_chain(data: bytes, first_cluster: int, max_length: int = 50000) -> L
 
 def cluster_to_offset(cluster: int) -> int:
     """Converte numero cluster in offset fisico nei dati."""
-    return DATA_START + ((cluster - 2) * CLUSTER_SIZE)
+    # Usa CLUSTER_INDEX_BASE rilevato dinamicamente
+    # HDD piccoli: 1-indexed, HDD 8GB: 2-indexed
+    return DATA_START + ((cluster - CLUSTER_INDEX_BASE) * CLUSTER_SIZE)
 
 # =============================================================================
 # PARSING DIRECTORY
@@ -244,6 +301,29 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
                 if inner_entries:
                     print(f"        (entries trovate in cluster {next_cluster})")
                     result['all_clusters'].add(next_cluster)
+            
+            # FIX v5.2: Se ancora non trova entries, cerca SaveMeta.xbx in TUTTO l'HDD!
+            # Alcuni giochi (es. Black) hanno le entries del save slot in cluster separati
+            # non collegati via FAT (es. cluster 9 vuoto, entries in cluster 17)
+            if not inner_entries:
+                print(f"        [!] Cluster {ss['first_cluster']} vuoto, ricerca brute-force...")
+                save_meta_pattern = b"SaveMeta.xbx"
+                
+                # Scansiona cluster 10-50 per trovare entries SaveMeta.xbx
+                for search_cluster in range(10, 51):
+                    search_offset = cluster_to_offset(search_cluster)
+                    if search_offset + CLUSTER_SIZE > len(data):
+                        break
+                    
+                    # Cerca SaveMeta.xbx in questo cluster
+                    chunk = data[search_offset:search_offset + CLUSTER_SIZE]
+                    if save_meta_pattern in chunk:
+                        # Trovato! Scansiona questo cluster per entries
+                        found_entries = scan_directory(data, search_cluster)
+                        if found_entries:
+                            print(f"        [✓] Trovate {len(found_entries)} entries in cluster {search_cluster}!")
+                            result['all_clusters'].add(search_cluster)
+                            inner_entries.extend(found_entries)
             
             for ie in inner_entries:
                 print(f"          -> {ie['filename']} @ cluster {ie['first_cluster']}")
@@ -455,6 +535,34 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
     
     # 3. Calcola entries FAT16 e FAT32
     print(f"\n[3] Calcola entries FAT...")
+    
+    # FIX v5.2: Estendi range includendo TUTTI i cluster allocati fino al primo FREE
+    # Questo cattura cluster come 18-19 di Black che non sono linkati via FAT
+    # ma sono comunque usati dal gioco (FAT entry != 0x0000)
+    if result['all_clusters']:
+        min_cluster = min(result['all_clusters'])
+        max_cluster = max(result['all_clusters'])
+        
+        # Trova il primo cluster FREE dopo max_cluster
+        first_free = max_cluster + 1
+        for c in range(max_cluster + 1, max_cluster + 100):
+            fat_val = read_fat16_entry(data, c)
+            if fat_val == 0x0000:
+                first_free = c
+                break
+        
+        # Includi tutti i cluster tra min e first_free-1 che sono allocati
+        extended_count = 0
+        for c in range(min_cluster, first_free):
+            if c not in result['all_clusters']:
+                fat_val = read_fat16_entry(data, c)
+                if fat_val != 0x0000:  # Cluster allocato (END-OF-CHAIN o punta ad altro)
+                    result['all_clusters'].add(c)
+                    extended_count += 1
+        
+        if extended_count > 0:
+            print(f"    [v5.2] Estesi {extended_count} cluster extra (range allocato fino a cluster {first_free-1})")
+    
     sorted_clusters = sorted(result['all_clusters'])
     print(f"    Cluster totali: {len(sorted_clusters)}")
     print(f"    Range: {sorted_clusters[0]} - {sorted_clusters[-1]}")
@@ -537,6 +645,10 @@ def backup_single_game_v5(game_id: str) -> Tuple[str, str]:
     with open(HDD_SOURCE, 'rb') as f:
         data = f.read()
     print(f"Size: {len(data):,} bytes")
+    
+    # Rileva tipo HDD
+    hdd_type = detect_hdd_type(data)
+    print(f"Tipo HDD: {hdd_type}")
     
     # Analisi dinamica (riusa la logica v4)
     analysis = analyze_game_dynamic(data, game_id)
@@ -755,7 +867,58 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
         data_chunks.append((cluster, offset, chunk_data))
     print(f"Data chunks: {len(data_chunks)}")
     
-    # === SCRIVI SU HDD TARGET ===
+    # === FASE 0: IDENTIFICA CLUSTER EXTRA (prima del restore) ===
+    # Se un file è cresciuto dopo il backup (es. Halo 2 da 140 a 1200+ cluster),
+    # i dati del checkpoint "nuovo" sono nei cluster extra.
+    # Dobbiamo azonarli DOPO aver ripristinato la FAT.
+    print(f"\n[FASE 0] Analisi TARGET per cluster extra...")
+    
+    # Leggi HDD target per analisi
+    with open(HDD_TARGET, 'rb') as f:
+        target_data = f.read()
+    
+    # Trova i cluster usati dal backup
+    backup_clusters = set()
+    for cluster, offset, chunk in data_chunks:
+        backup_clusters.add(cluster)
+    
+    print(f"    Cluster nel backup: {len(backup_clusters)}")
+    
+    # Trova la FAT chain ATTUALE sul target per ogni file
+    # Questo ci dice quali cluster sono usati ORA (checkpoint B)
+    target_extra_clusters = set()
+    
+    for dir_offset, dir_entry in dir_entries:
+        # Estrai first_cluster dalla entry del BACKUP
+        first_cluster = struct.unpack('<I', dir_entry[44:48])[0]
+        if first_cluster == 0 or first_cluster >= 0xFFF0:
+            continue
+        
+        # Segui la FAT chain attuale sul TARGET (non sul backup!)
+        current = first_cluster
+        seen = set()
+        while current > 0 and current < 0xFFF0 and current not in seen:
+            seen.add(current)
+            # Se questo cluster NON è nel backup, è un cluster "extra"
+            if current not in backup_clusters:
+                target_extra_clusters.add(current)
+            # Leggi prossimo cluster dalla FAT16 del TARGET
+            fat_off = FAT_TABLE_OFFSET + (current * 2)
+            if fat_off + 2 <= len(target_data):
+                next_cluster = struct.unpack('<H', target_data[fat_off:fat_off + 2])[0]
+                if next_cluster >= 0xFFF8:
+                    break
+                current = next_cluster
+            else:
+                break
+    
+    if target_extra_clusters:
+        print(f"    ⚠️  TROVATI {len(target_extra_clusters)} cluster EXTRA (file cresciuto)")
+        print(f"    Range: {min(target_extra_clusters)} - {max(target_extra_clusters)}")
+    else:
+        print(f"    ✓ Nessun cluster extra")
+    
+    # === SCRIVI SU HDD TARGET (restore normale) ===
     print(f"\nScrittura su: {Path(HDD_TARGET).name}")
     
     with open(HDD_TARGET, 'r+b') as f:
@@ -787,6 +950,23 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
         total_data = sum(len(c[2]) for c in data_chunks)
         print(f"        Scritti {total_data:,} bytes")
         
+        # === FASE 5: AZZERA DATI DEI CLUSTER EXTRA ===
+        # DISABILITATO: Questa funzionalità può corrompere dati di altri giochi!
+        # Era pensata per Halo 2 ma 7000+ cluster = 116MB azzerati è troppo rischioso
+        # Riattivare solo se necessario per casi specifici
+        ENABLE_CLUSTER_ZEROING = False  # ⚠️ PERICOLOSO - lasciare a False!
+        
+        if target_extra_clusters and ENABLE_CLUSTER_ZEROING:
+            print(f"\n  [5/5] Azzeramento dati cluster extra...")
+            for cluster in sorted(target_extra_clusters):
+                data_offset = cluster_to_offset(cluster)
+                f.seek(data_offset)
+                f.write(b'\x00' * CLUSTER_SIZE)
+            print(f"        Azzerati {len(target_extra_clusters)} cluster ({len(target_extra_clusters) * CLUSTER_SIZE:,} bytes)")
+        elif target_extra_clusters:
+            print(f"\n  [SKIP] Azzeramento cluster extra DISABILITATO (sicurezza)")
+            print(f"         {len(target_extra_clusters)} cluster NON azzerati")
+        
         # Flush
         f.flush()
         os.fsync(f.fileno())
@@ -794,6 +974,8 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
     print("\n" + "=" * 70)
     print("RESTORE v5 COMPLETATO!")
     print("=" * 70)
+    if target_extra_clusters:
+        print(f"✅ Azzerati {len(target_extra_clusters)} cluster extra (dati checkpoint nuovo rimossi)")
     print("FAT range ripristinato - questo include tutti i 'cluster collaterali'")
     print("Gli altri giochi NON sono stati toccati.")
     print("Ora puoi testare con xemu!")
@@ -820,6 +1002,10 @@ def backup_single_game_v4(game_id: str) -> Tuple[str, str]:
     with open(HDD_SOURCE, 'rb') as f:
         data = f.read()
     print(f"Size: {len(data):,} bytes")
+    
+    # Rileva tipo HDD
+    hdd_type = detect_hdd_type(data)
+    print(f"Tipo HDD: {hdd_type}")
     
     # Analisi dinamica
     analysis = analyze_game_dynamic(data, game_id)
@@ -1063,6 +1249,10 @@ def list_available_games() -> List[Dict]:
     with open(HDD_SOURCE, 'rb') as f:
         data = f.read()
     
+    # Rileva tipo HDD e imposta offset corretti
+    hdd_type = detect_hdd_type(data)
+    print(f"Tipo HDD rilevato: {hdd_type} (FAT @ 0x{FAT_TABLE_OFFSET:08x}, DATA @ 0x{DATA_START:08x})")
+    
     # Scan UDATA (cluster 4)
     udata_entries = scan_directory(data, 4)
     
@@ -1103,9 +1293,10 @@ def list_backups() -> List[Path]:
 
 def main():
     print("=" * 70)
-    print("SINGLE GAME MERGER v5 - Backup/Restore con FAT RANGE")
+    print("SINGLE GAME MERGER v5.2 - Backup/Restore con FAT RANGE")
     print("=" * 70)
-    print("\nNOTA: v5 usa FAT RANGE che risolve problemi come Halo 2")
+    print("\nNOTA: v5.2 rileva automaticamente il tipo di HDD (piccolo vs 8GB)")
+    print("      Risolve problemi come Halo 2 e Black")
     print("      Le opzioni v4 sono disponibili per compatibilita'")
     
     while True:
