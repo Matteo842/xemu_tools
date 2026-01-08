@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-SINGLE GAME MERGER v5.4 - Backup/Restore con FAT RANGE per Xbox saves
+SINGLE GAME MERGER v5.5 - Backup/Restore con FAT RANGE per Xbox saves (Smart Adjacency)
+
+NOVITA' v5.5:
+- SMART ADJACENCY FIX: Risolve problema "Black" senza rallentare HDD pieni
+- Invece di riempire interi range, cattura solo cluster orfani ADIACENTI
+- Più sicuro, non rischia di includere altri giochi se ci sono gap
 
 NOVITA' v5.4:
 - RICERCA INTELLIGENTE SaveMeta.xbx (sostituisce brute-force)
@@ -38,7 +43,7 @@ from typing import List, Dict, Set, Optional, Tuple
 # CONFIGURAZIONE
 # =============================================================================
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hddf.qcow2"  # Checkpoint 1 (backup)
+HDD_SOURCE = r"D:\xemu\bk\xbox_hdd5.qcow2"  # Checkpoint 1 (backup)
 HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"        # HDD da modificare
 BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
 
@@ -564,32 +569,36 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
     # 3. Calcola entries FAT16 e FAT32
     print(f"\n[3] Calcola entries FAT...")
     
-    # FIX v5.2: Estendi range includendo TUTTI i cluster allocati fino al primo FREE
-    # Questo cattura cluster come 18-19 di Black che non sono linkati via FAT
-    # ma sono comunque usati dal gioco (FAT entry != 0x0000)
+    # FIX v5.5 (Middle Ground): Estensione prudente per cluster orfani (es. Black)
+    # Invece di riempire tutto il range (che su HDD pieni include altri giochi!),
+    # controlliamo solo cluster IMMEDIATAMENTE ADIACENTI ai blocchi noti.
     if result['all_clusters']:
-        min_cluster = min(result['all_clusters'])
-        max_cluster = max(result['all_clusters'])
-        
-        # Trova il primo cluster FREE dopo max_cluster
-        first_free = max_cluster + 1
-        for c in range(max_cluster + 1, max_cluster + 100):
-            fat_val = read_fat16_entry(data, c)
-            if fat_val == 0x0000:
-                first_free = c
-                break
-        
-        # Includi tutti i cluster tra min e first_free-1 che sono allocati
+        sorted_known = sorted(list(result['all_clusters']))
         extended_count = 0
-        for c in range(min_cluster, first_free):
-            if c not in result['all_clusters']:
-                fat_val = read_fat16_entry(data, c)
-                if fat_val != 0x0000:  # Cluster allocato (END-OF-CHAIN o punta ad altro)
-                    result['all_clusters'].add(c)
-                    extended_count += 1
+        
+        # Identifica "blocchi" di cluster continuativi e prova a estendere solo la fine di ogni blocco
+        # di max 3 cluster, se sono allocati.
+        
+        # Set iniziale per evitare modifiche durante iterazione
+        current_clusters = result['all_clusters'].copy()
+        
+        for c in sorted_known:
+            # Controlla i 3 cluster successivi a ogni cluster noto
+            for offset in range(1, 4): 
+                candidate = c + offset
+                if candidate not in result['all_clusters']:
+                    fat_val = read_fat16_entry(data, candidate)
+                    # Se è allocato (non 0x0000) e non è troppo lontano
+                    if fat_val != 0x0000:
+                        result['all_clusters'].add(candidate)
+                        extended_count += 1
+                        # print(f"      [SmartFix] Incluso cluster adiacente orfano: {candidate}")
+                    else:
+                        # Se troviamo un buco (0x0000), smettiamo di cercare in questa direzione
+                        break
         
         if extended_count > 0:
-            print(f"    [v5.2] Estesi {extended_count} cluster extra (range allocato fino a cluster {first_free-1})")
+            print(f"    [v5.5] Inclusi {extended_count} cluster adiacenti orfani (Smart Fix)")
     
     sorted_clusters = sorted(result['all_clusters'])
     print(f"    Cluster totali: {len(sorted_clusters)}")
