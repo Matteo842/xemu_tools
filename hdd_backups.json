@@ -1,0 +1,100 @@
+{
+    "xemu_root": "D:\\xemu",
+    "backup_folder": "D:\\xemu\\bk",
+    "target_hdd": "xbox_hdd.qcow2",
+    "backups": [
+        {
+            "id": "1",
+            "filename": "xbox_hdd1.qcow2",
+            "description": "Mercenaries",
+            "games": [
+                "Mercenaries"
+            ]
+        },
+        {
+            "id": "2",
+            "filename": "xbox_hdd2.qcow2",
+            "description": "Mercenaries + ToeJam",
+            "games": [
+                "Mercenaries",
+                "ToeJam & Earl III"
+            ]
+        },
+        {
+            "id": "3",
+            "filename": "xbox_hdd3.qcow2",
+            "description": "Mercenaries + ToeJam + Halo 2",
+            "games": [
+                "Mercenaries",
+                "ToeJam & Earl III",
+                "Halo 2"
+            ]
+        },
+        {
+            "id": "4",
+            "filename": "xbox_hdd4.qcow2",
+            "description": "Need for Speed Underground 2",
+            "games": [
+                "NFS Underground 2"
+            ]
+        },
+        {
+            "id": "5",
+            "filename": "xbox_hdd5.qcow2",
+            "description": "Tutti e 4 i giochi (Merc + TJ + Halo + NFS)",
+            "games": [
+                "Mercenaries",
+                "ToeJam & Earl III",
+                "Halo 2",
+                "NFS Underground 2"
+            ]
+        },
+        {
+            "id": "6",
+            "filename": "xbox_hdd6.qcow2",
+            "description": "Merc + TJ + Halo (CP avanzati) + NFS",
+            "games": [
+                "Mercenaries",
+                "ToeJam & Earl III",
+                "Halo 2 (CP avanzati)",
+                "NFS Underground 2"
+            ]
+        },
+        {
+            "id": "h1",
+            "filename": "xbox_hddh1.qcow2",
+            "description": "Halo 2 - Checkpoint 1",
+            "games": [
+                "Halo 2"
+            ],
+            "checkpoint": 1
+        },
+        {
+            "id": "h2",
+            "filename": "xbox_hddh2.qcow2",
+            "description": "Halo 2 - Checkpoint 2",
+            "games": [
+                "Halo 2"
+            ],
+            "checkpoint": 2
+        },
+        {
+            "id": "b1",
+            "filename": "xbox_hddB1.qcow2",
+            "description": "Black - Checkpoint 1 (1%)",
+            "games": [
+                "Black"
+            ],
+            "checkpoint": 1
+        },
+        {
+            "id": "b2",
+            "filename": "xbox_hddB2.qcow2",
+            "description": "Black - Checkpoint 2 (3%)",
+            "games": [
+                "Black"
+            ],
+            "checkpoint": 2
+        }
+    ]
+}

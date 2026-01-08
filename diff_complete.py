@@ -4,12 +4,12 @@ DIFF COMPLETA - Trova TUTTE le differenze tra source e target
 Output salvato su file per evitare overflow console
 """
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hddb1.qcow2"  # Checkpoint 1
-HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"  # Checkpoint 2
+HDD_SOURCE = r"D:\xemu\bk\xbox_hddf.qcow2"  # Forza CON profilo
+HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"  # Forza SENZA profilo (eliminato)
 OUTPUT_FILE = r"D:\GitHub\xemu_tools\diff_output.txt"
 
-# Area dati FATX inizia qui
-DATA_START = 0x00430000
+# Area dati FATX per HDD piccoli (xemu nuovo)
+DATA_START = 0x001B3000
 CLUSTER_SIZE = 16384
 
 print("=" * 70)

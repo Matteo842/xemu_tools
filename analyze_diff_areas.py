@@ -5,8 +5,8 @@ Confronto dettagliato auxilary.bin e cache tra H1 e H2
 
 import struct
 
-HDD_H1 = r"D:\xemu\bk\xbox_hddh1.qcow2"
-HDD_H2 = r"D:\xemu\bk\xbox_hddh2.qcow2"
+HDD_H1 = r"D:\xemu\bk\xbox_hddt1.qcow2"
+HDD_H2 = r"D:\xemu\bk\xbox_hddt2.qcow2"
 
 DATA_START = 0x001B3000
 CLUSTER_SIZE = 16384

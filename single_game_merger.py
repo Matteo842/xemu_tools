@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-SINGLE GAME MERGER v5.2 - Backup/Restore con FAT RANGE per Xbox saves
+SINGLE GAME MERGER v5.4 - Backup/Restore con FAT RANGE per Xbox saves
+
+NOVITA' v5.4:
+- RICERCA INTELLIGENTE SaveMeta.xbx (sostituisce brute-force)
+- Cerca SaveMeta.xbx i cui dati puntano a cluster nel range del save slot
+- Più preciso e meno falsi positivi
 
 NOVITA' v5.2:
 - RILEVAMENTO AUTOMATICO tipo HDD (piccolo vs 8GB)
@@ -33,8 +38,8 @@ from typing import List, Dict, Set, Optional, Tuple
 # CONFIGURAZIONE
 # =============================================================================
 
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd5.qcow2"  # Checkpoint 1 (backup)
-HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"        # HDD da modificare (copiare h2 qui prima del test)
+HDD_SOURCE = r"D:\xemu\bk\xbox_hddf.qcow2"  # Checkpoint 1 (backup)
+HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"        # HDD da modificare
 BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
 
 # Costanti globali - verranno impostate da detect_hdd_type()
@@ -52,6 +57,7 @@ GAME_NAMES = {
     "4d530064": "Halo 2",
     "4541005a": "NFS Underground 2",
     "45410083": "Black",
+    "4d53006e": "Forza Motorsport",
 }
 
 def detect_hdd_type(data: bytes) -> str:
@@ -302,28 +308,50 @@ def analyze_game_dynamic(data: bytes, game_id: str) -> Optional[Dict]:
                     print(f"        (entries trovate in cluster {next_cluster})")
                     result['all_clusters'].add(next_cluster)
             
-            # FIX v5.2: Se ancora non trova entries, cerca SaveMeta.xbx in TUTTO l'HDD!
-            # Alcuni giochi (es. Black) hanno le entries del save slot in cluster separati
-            # non collegati via FAT (es. cluster 9 vuoto, entries in cluster 17)
+            # FIX v5.4: Ricerca intelligente SaveMeta.xbx per trovare save slot entries
+            # Invece di brute-force su cluster 10-50, cerchiamo SaveMeta.xbx nell'intero HDD
+            # e filtriamo per quelli che puntano a cluster nel range del save slot
             if not inner_entries:
-                print(f"        [!] Cluster {ss['first_cluster']} vuoto, ricerca brute-force...")
+                print(f"        [v5.4] Ricerca intelligente SaveMeta.xbx...")
                 save_meta_pattern = b"SaveMeta.xbx"
                 
-                # Scansiona cluster 10-50 per trovare entries SaveMeta.xbx
-                for search_cluster in range(10, 51):
-                    search_offset = cluster_to_offset(search_cluster)
-                    if search_offset + CLUSTER_SIZE > len(data):
+                # Range di cluster "vicini" a questo save slot
+                slot_first_cluster = ss['first_cluster']
+                cluster_range_min = slot_first_cluster
+                cluster_range_max = slot_first_cluster + 20  # Margine di 20 cluster
+                
+                # Cerca TUTTE le occorrenze di SaveMeta.xbx
+                pos = DATA_START
+                while True:
+                    pos = data.find(save_meta_pattern, pos)
+                    if pos == -1:
                         break
                     
-                    # Cerca SaveMeta.xbx in questo cluster
-                    chunk = data[search_offset:search_offset + CLUSTER_SIZE]
-                    if save_meta_pattern in chunk:
-                        # Trovato! Scansiona questo cluster per entries
-                        found_entries = scan_directory(data, search_cluster)
-                        if found_entries:
-                            print(f"        [✓] Trovate {len(found_entries)} entries in cluster {search_cluster}!")
-                            result['all_clusters'].add(search_cluster)
-                            inner_entries.extend(found_entries)
+                    # Questa è l'entry SaveMeta.xbx (il nome inizia 2 bytes dopo l'inizio dell'entry)
+                    entry_start = pos - 2
+                    if entry_start >= DATA_START:
+                        # Leggi l'entry per ottenere il first cluster del DATI di SaveMeta.xbx
+                        entry_data = data[entry_start:entry_start + 64]
+                        if len(entry_data) >= 64:
+                            data_first_cluster = struct.unpack('<I', entry_data[44:48])[0]
+                            
+                            # Se i dati di SaveMeta.xbx puntano a un cluster nel range del save slot
+                            # allora questa SaveMeta.xbx appartiene a questo gioco!
+                            if cluster_range_min <= data_first_cluster <= cluster_range_max:
+                                entry_cluster = (entry_start - DATA_START) // CLUSTER_SIZE + CLUSTER_INDEX_BASE
+                                
+                                print(f"        [✓] Trovato SaveMeta.xbx in cluster {entry_cluster}")
+                                print(f"            dati -> cluster {data_first_cluster}, nel range ({cluster_range_min}-{cluster_range_max})")
+                                
+                                # Aggiungi il cluster che contiene le entries
+                                result['all_clusters'].add(entry_cluster)
+                                
+                                # Scansiona le entries in questo cluster
+                                found_entries = scan_directory(data, entry_cluster)
+                                if found_entries:
+                                    inner_entries.extend(found_entries)
+                    
+                    pos += 1
             
             for ie in inner_entries:
                 print(f"          -> {ie['filename']} @ cluster {ie['first_cluster']}")
@@ -867,57 +895,6 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
         data_chunks.append((cluster, offset, chunk_data))
     print(f"Data chunks: {len(data_chunks)}")
     
-    # === FASE 0: IDENTIFICA CLUSTER EXTRA (prima del restore) ===
-    # Se un file è cresciuto dopo il backup (es. Halo 2 da 140 a 1200+ cluster),
-    # i dati del checkpoint "nuovo" sono nei cluster extra.
-    # Dobbiamo azonarli DOPO aver ripristinato la FAT.
-    print(f"\n[FASE 0] Analisi TARGET per cluster extra...")
-    
-    # Leggi HDD target per analisi
-    with open(HDD_TARGET, 'rb') as f:
-        target_data = f.read()
-    
-    # Trova i cluster usati dal backup
-    backup_clusters = set()
-    for cluster, offset, chunk in data_chunks:
-        backup_clusters.add(cluster)
-    
-    print(f"    Cluster nel backup: {len(backup_clusters)}")
-    
-    # Trova la FAT chain ATTUALE sul target per ogni file
-    # Questo ci dice quali cluster sono usati ORA (checkpoint B)
-    target_extra_clusters = set()
-    
-    for dir_offset, dir_entry in dir_entries:
-        # Estrai first_cluster dalla entry del BACKUP
-        first_cluster = struct.unpack('<I', dir_entry[44:48])[0]
-        if first_cluster == 0 or first_cluster >= 0xFFF0:
-            continue
-        
-        # Segui la FAT chain attuale sul TARGET (non sul backup!)
-        current = first_cluster
-        seen = set()
-        while current > 0 and current < 0xFFF0 and current not in seen:
-            seen.add(current)
-            # Se questo cluster NON è nel backup, è un cluster "extra"
-            if current not in backup_clusters:
-                target_extra_clusters.add(current)
-            # Leggi prossimo cluster dalla FAT16 del TARGET
-            fat_off = FAT_TABLE_OFFSET + (current * 2)
-            if fat_off + 2 <= len(target_data):
-                next_cluster = struct.unpack('<H', target_data[fat_off:fat_off + 2])[0]
-                if next_cluster >= 0xFFF8:
-                    break
-                current = next_cluster
-            else:
-                break
-    
-    if target_extra_clusters:
-        print(f"    ⚠️  TROVATI {len(target_extra_clusters)} cluster EXTRA (file cresciuto)")
-        print(f"    Range: {min(target_extra_clusters)} - {max(target_extra_clusters)}")
-    else:
-        print(f"    ✓ Nessun cluster extra")
-    
     # === SCRIVI SU HDD TARGET (restore normale) ===
     print(f"\nScrittura su: {Path(HDD_TARGET).name}")
     
@@ -950,23 +927,6 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
         total_data = sum(len(c[2]) for c in data_chunks)
         print(f"        Scritti {total_data:,} bytes")
         
-        # === FASE 5: AZZERA DATI DEI CLUSTER EXTRA ===
-        # DISABILITATO: Questa funzionalità può corrompere dati di altri giochi!
-        # Era pensata per Halo 2 ma 7000+ cluster = 116MB azzerati è troppo rischioso
-        # Riattivare solo se necessario per casi specifici
-        ENABLE_CLUSTER_ZEROING = False  # ⚠️ PERICOLOSO - lasciare a False!
-        
-        if target_extra_clusters and ENABLE_CLUSTER_ZEROING:
-            print(f"\n  [5/5] Azzeramento dati cluster extra...")
-            for cluster in sorted(target_extra_clusters):
-                data_offset = cluster_to_offset(cluster)
-                f.seek(data_offset)
-                f.write(b'\x00' * CLUSTER_SIZE)
-            print(f"        Azzerati {len(target_extra_clusters)} cluster ({len(target_extra_clusters) * CLUSTER_SIZE:,} bytes)")
-        elif target_extra_clusters:
-            print(f"\n  [SKIP] Azzeramento cluster extra DISABILITATO (sicurezza)")
-            print(f"         {len(target_extra_clusters)} cluster NON azzerati")
-        
         # Flush
         f.flush()
         os.fsync(f.fileno())
@@ -974,8 +934,6 @@ def restore_single_game_v5(backup_file: str, metadata_file: str) -> bool:
     print("\n" + "=" * 70)
     print("RESTORE v5 COMPLETATO!")
     print("=" * 70)
-    if target_extra_clusters:
-        print(f"✅ Azzerati {len(target_extra_clusters)} cluster extra (dati checkpoint nuovo rimossi)")
     print("FAT range ripristinato - questo include tutti i 'cluster collaterali'")
     print("Gli altri giochi NON sono stati toccati.")
     print("Ora puoi testare con xemu!")
