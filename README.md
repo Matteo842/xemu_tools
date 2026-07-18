@@ -1,12 +1,48 @@
 # 🎮 Xbox Save Surgical Restore Tool
 
-## 🏆 Project Status: PRODUCTION READY (v5.1)
+## Current status: READ-ONLY SAFETY GATE
 
-**Surgical backup and restore for Xbox game saves on xemu emulator** - A sophisticated tool that enables per-game backup and restore operations without affecting other games on the same virtual HDD.
+The old v5/v5.5 workflow remains valuable as an empirically tested legacy
+oracle, but it interprets physical QCOW2 container offsets as guest disk
+offsets. Its restore path must not be used on the active HDD.
 
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/Status-Read--Only%20Gate-orange.svg)]()
+
+---
+
+## Safe entry point
+
+Run `START_XEMU_TEST.bat`, which opens the single numerical menu implemented by
+`xemu_test_lab.py`.
+
+The current build can:
+
+- inspect QCOW2 v3 images through their real L1/L2 mapping;
+- parse the fixed Xbox partitions and FATX structures in guest coordinates;
+- compare images guest-aware;
+- inventory the scenarios from `hdd_backups.json`;
+- run the Black B1/B2 and Halo H1/H2 forensic checks.
+
+Backup, restore, golden-to-active copy, and every other write operation are
+visible but intentionally blocked. `D:\xemu\bk` and
+`D:\xemu\xbox_hdd.qcow2` are never opened for writing.
+
+### Read-only gate result (17 July 2026)
+
+- Black B1/B2: PASS, 64 different guest bytes: CONFIG 1 byte; FATX E data
+  clusters 5/9/11 contain 2/2/59 bytes.
+- Halo H1/H2: PASS, 428,287,103 different guest bytes: Y cache 427,278,322;
+  E data 1,008,759; all other regions 22.
+- These checks validate address translation and classification. They do not
+  prove that B1 or B2 is gameplay-safe.
+- The write gate remains closed. The first future restore test will use HDD 1
+  on a verified active copy, never B1/B2 as a trusted golden source.
+
+The remainder of this README records the historical v5-era behavior and manual
+test evidence. Its old physical-offset explanations are not the specification
+for the new implementation.
 
 ---
 
@@ -89,7 +125,7 @@ The Xbox FATX filesystem presents unique challenges:
 | v2 | Hardcoded metadata areas | Game-specific, not scalable |
 | v3 | Dynamic FAT calculation | Failed due to incorrect assumptions |
 | v4 | Dynamic cluster analysis | Worked for some games, missed collateral clusters |
-| **v5** | **FAT Range + Dynamic** | **Production solution** |
+| **v5** | **FAT Range + Dynamic** | **Empirically successful legacy; host-offset model** |
 | v5.1 | Sibling slots + Cluster offset fix | Extended compatibility |
 
 ### v5 FAT Range Strategy
@@ -134,30 +170,28 @@ xemu_tools/
 
 ### Quick Start
 
-```bash
-python single_game_merger.py
+```bat
+START_XEMU_TEST.bat
 ```
 
 ### Menu Options
 
 ```
-1. List available games
-2. Backup FAT RANGE v5 (RECOMMENDED)
-3. Backup dynamic v4 (legacy)
-4. Restore (auto-detect version)
-5. List backups
+1. Ciclo test completo                 [BLOCCATO]
+2. Solo backup save                    [BLOCCATO]
+3. Solo restore save                   [BLOCCATO]
+4. Ripristina HDD attivo da golden     [BLOCCATO]
+5. Analizza/confronta HDD
+6. Catalogo HDD e risultati
 0. Exit
 ```
 
 ### Configuration
 
-Edit paths at the top of `single_game_merger.py`:
-
-```python
-HDD_SOURCE = r"D:\xemu\bk\xbox_hdd_backup.qcow2"  # Source (read-only)
-HDD_TARGET = r"D:\xemu\xbox_hdd.qcow2"            # Target (modified)
-BACKUP_DIR = r"d:\GitHub\xemu_tools\surgical_backups"
-```
+Paths and scenario descriptions are read from `hdd_backups.json`; the active
+path is also checked against xemu's `xemu.toml`. Do not launch
+`single_game_merger.py` for restore: it is retained only as the v5.5 legacy
+oracle until a safe write backend exists.
 
 ---
 
@@ -254,7 +288,7 @@ This tool is designed to integrate with [SaveState](https://github.com/...), a u
 | Dec 2025 | v4 dynamic approach, partial success |
 | Jan 3, 2026 | v5 FAT Range solves Halo 2 |
 | Jan 4, 2026 | v5.1 extended compatibility, NFS working |
-| Jan 4, 2026 | **Production ready, surgical restore verified** |
+| Jan 4, 2026 | **Manual surgical restore checkpoint (legacy v5-era workflow)** |
 
 ---
 
