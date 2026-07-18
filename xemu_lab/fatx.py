@@ -112,6 +112,12 @@ class FATXHeader:
     def reserved_cluster_start(self) -> int:
         return 0xFFF0 if self.is_fat16 else 0xFFFFFFF0
 
+    @property
+    def end_of_chain_start(self) -> int:
+        """Primo valore FAT che termina una catena (incluse varianti EOC)."""
+
+        return 0xFFF8 if self.is_fat16 else 0xFFFFFFF8
+
 
 @dataclass(frozen=True)
 class FATXLocation:
@@ -361,12 +367,13 @@ class FATXVolume:
             seen.add(current)
             chain.append(current)
             next_cluster = self.read_fat_entry(current)
-            if next_cluster == self.header.last_cluster_marker:
-                break
             if next_cluster == 0:
                 raise FATXFormatError(
                     f"Catena FAT interrotta dopo il cluster {current}"
                 )
+            # FAT16/FAT32 usano un intervallo di marker EOC (es. 0xFFF8..0xFFFF).
+            if next_cluster >= self.header.end_of_chain_start:
+                break
             if next_cluster >= self.header.reserved_cluster_start:
                 raise FATXFormatError(
                     f"Marker FAT 0x{next_cluster:x} inatteso "

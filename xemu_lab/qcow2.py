@@ -54,6 +54,10 @@ class UnsupportedQCOW2Feature(QCOW2Error):
     """Il contenitore usa una funzione non supportata in sicurezza."""
 
 
+class QCOW2WriteError(QCOW2Error):
+    """Scrittura rifiutata o fallita sul block device."""
+
+
 class BlockDevice(Protocol):
     """Interfaccia minima usata dai parser guest-aware."""
 
@@ -533,3 +537,135 @@ class QCOW2BlockDevice:
     def _require_open(self) -> None:
         if self._file is None:
             raise QCOW2Error("Block device non aperto; usare il context manager")
+
+
+class QCOW2WritableBlockDevice(QCOW2BlockDevice):
+    """Block device QCOW2 con overwrite guest-aware, senza allocate-on-write.
+
+    Scrive solo su cluster host già allocati, non zero e non compressi.
+    Non crea cluster, non aggiorna L2/refcount e non supporta overlay.
+    """
+
+    def __init__(self, path: PathLike):
+        super().__init__(path)
+        self._writable = False
+
+    def __enter__(self) -> "QCOW2WritableBlockDevice":
+        return self.open()
+
+    def open(self) -> "QCOW2WritableBlockDevice":
+        if self._file is not None:
+            if not self._writable:
+                raise QCOW2WriteError(
+                    "Device già aperto in sola lettura; chiudere e riaprire"
+                )
+            return self
+
+        try:
+            self._file = self.path.open("r+b")
+            self._writable = True
+            self._host_size = os.fstat(self._file.fileno()).st_size
+            self._header = self._read_header()
+            self._l1_table = self._read_l1_table()
+            self._validate_l1_coverage()
+            if self.header.is_dirty:
+                raise QCOW2WriteError(
+                    "QCOW2 con dirty bit: scrittura rifiutata"
+                )
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def close(self) -> None:
+        self._writable = False
+        super().close()
+
+    def write_at(self, offset: int, data: bytes) -> None:
+        """Sovrascrive byte guest solo dove il mapping host è già allocato."""
+
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("I dati da scrivere devono essere bytes-like")
+        payload = bytes(data)
+        self._validate_guest_range(offset, len(payload))
+        self._require_writable()
+        if not payload:
+            return
+
+        # Pre-flight: nessun cluster deve richiedere allocazione.
+        cursor = 0
+        while cursor < len(payload):
+            guest_offset = offset + cursor
+            guest_cluster = guest_offset // self.cluster_size
+            in_cluster = guest_offset % self.cluster_size
+            chunk_size = min(
+                len(payload) - cursor,
+                self.cluster_size - in_cluster,
+            )
+            self._require_writable_mapping(guest_cluster)
+            cursor += chunk_size
+
+        cursor = 0
+        while cursor < len(payload):
+            guest_offset = offset + cursor
+            guest_cluster = guest_offset // self.cluster_size
+            in_cluster = guest_offset % self.cluster_size
+            chunk_size = min(
+                len(payload) - cursor,
+                self.cluster_size - in_cluster,
+            )
+            mapping = self._require_writable_mapping(guest_cluster)
+            assert mapping.host_offset is not None
+            self._write_exact_host(
+                mapping.host_offset + in_cluster,
+                payload[cursor : cursor + chunk_size],
+            )
+            cursor += chunk_size
+
+    def flush(self) -> None:
+        self._require_writable()
+        assert self._file is not None
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def _require_writable(self) -> None:
+        self._require_open()
+        if not self._writable:
+            raise QCOW2WriteError("Block device non aperto in scrittura")
+
+    def _require_writable_mapping(self, guest_cluster: int) -> ClusterMapping:
+        if self.is_compressed_cluster(guest_cluster):
+            raise UnsupportedQCOW2Feature(
+                f"Cluster guest {guest_cluster} compresso: "
+                "scrittura non supportata"
+            )
+        mapping = self.map_cluster(guest_cluster)
+        if not mapping.allocated or mapping.reads_as_zero:
+            raise QCOW2WriteError(
+                f"Cluster guest {guest_cluster} non allocato o zero: "
+                "allocate-on-write non supportato"
+            )
+        if mapping.host_offset is None:
+            raise QCOW2WriteError(
+                f"Cluster guest {guest_cluster} senza offset host"
+            )
+        return mapping
+
+    def _write_exact_host(self, offset: int, data: bytes) -> None:
+        self._require_writable()
+        size = len(data)
+        if offset < 0 or size < 0 or offset > self._host_size:
+            raise QCOW2FormatError("Intervallo host non valido in scrittura")
+        if size > self._host_size - offset:
+            raise QCOW2FormatError(
+                "Scrittura oltre la fine del file host "
+                "(niente crescita file in questa fase)"
+            )
+
+        assert self._file is not None
+        self._file.seek(offset)
+        written = self._file.write(data)
+        if written != size:
+            raise QCOW2WriteError(
+                f"Scrittura host incompleta: richiesti {size}, scritti {written}"
+            )

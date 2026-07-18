@@ -6,6 +6,8 @@ from .qcow2 import (
     QCOW2BlockDevice,
     QCOW2Error,
     QCOW2FormatError,
+    QCOW2WritableBlockDevice,
+    QCOW2WriteError,
     UnsupportedQCOW2Feature,
 )
 
@@ -15,5 +17,7 @@ __all__ = [
     "QCOW2BlockDevice",
     "QCOW2Error",
     "QCOW2FormatError",
+    "QCOW2WritableBlockDevice",
+    "QCOW2WriteError",
     "UnsupportedQCOW2Feature",
 ]

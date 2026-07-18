@@ -1,6 +1,5 @@
 /surgical_backups
-/__pycache__
-*.pyc
+/surgical_backups_v6
 /__pycache__
 *.pyc
 *.txt

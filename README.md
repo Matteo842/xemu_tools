@@ -1,14 +1,24 @@
 # 🎮 Xbox Save Surgical Restore Tool
 
-## Current status: READ-ONLY SAFETY GATE
+## Current status: QEMU-FREE GUEST-AWARE WRITES
 
-The old v5/v5.5 workflow remains valuable as an empirically tested legacy
-oracle, but it interprets physical QCOW2 container offsets as guest disk
-offsets. Its restore path must not be used on the active HDD.
+The lab maps guest disk offsets through real QCOW2 L1/L2 tables, then backups
+and restores saves with overwrite-only writes on already-allocated host
+clusters. **No qemu-img / QEMU binary is used or required.**
+
+Why QEMU is excluded (project constraint since the early phases): forced Linux
+compatibility rules out shipping a Windows `qemu.exe`; stock `qemu-img convert`
+rebuilt images with wrong sizes; building xemu’s modified QEMU tools from
+source on Ubuntu did not produce usable qemu utilities. Writes go through the
+Python block device in `xemu_lab/qcow2.py` instead.
+
+The old v5/v5.5 merger remains an empirical discovery oracle, but its restore
+path still treats host file offsets as guest offsets and must not be used on
+the active HDD.
 
 [![Python](https://img.shields.io/badge/Python-3.x-blue.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Read--Only%20Gate-orange.svg)]()
+[![Status](https://img.shields.io/badge/Status-Guest--Aware%20Write-green.svg)]()
 
 ---
 
@@ -23,11 +33,13 @@ The current build can:
 - parse the fixed Xbox partitions and FATX structures in guest coordinates;
 - compare images guest-aware;
 - inventory the scenarios from `hdd_backups.json`;
-- run the Black B1/B2 and Halo H1/H2 forensic checks.
+- run the Black B1/B2 and Halo H1/H2 forensic checks;
+- copy a golden onto the active HDD (atomic temp + hash verify);
+- backup/restore a Title ID as XBSV v6 (guest offsets only);
+- run the guided HDD 1 / Mercenaries cycle.
 
-Backup, restore, golden-to-active copy, and every other write operation are
-visible but intentionally blocked. `D:\xemu\bk` and
-`D:\xemu\xbox_hdd.qcow2` are never opened for writing.
+Golden images under `D:\xemu\bk` are never opened for writing. Allocate-on-write
+(new QCOW2 clusters / L2 updates) is intentionally unsupported in this phase.
 
 ### Read-only gate result (17 July 2026)
 
@@ -35,10 +47,9 @@ visible but intentionally blocked. `D:\xemu\bk` and
   clusters 5/9/11 contain 2/2/59 bytes.
 - Halo H1/H2: PASS, 428,287,103 different guest bytes: Y cache 427,278,322;
   E data 1,008,759; all other regions 22.
-- These checks validate address translation and classification. They do not
-  prove that B1 or B2 is gameplay-safe.
-- The write gate remains closed. The first future restore test will use HDD 1
-  on a verified active copy, never B1/B2 as a trusted golden source.
+- Gameplay confirmation (18 July 2026): B1 and B2 both load in xemu; they remain
+  forensic fixtures, not restore goldens.
+- First write collaudo target: HDD 1 (Mercenaries) on a verified active copy.
 
 The remainder of this README records the historical v5-era behavior and manual
 test evidence. Its old physical-offset explanations are not the specification

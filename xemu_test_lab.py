@@ -4,11 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
+from xemu_lab.backup import (
+    DEFAULT_BACKUP_DIR,
+    BackupError,
+    backup_display_label,
+    backup_title_id_from_path,
+    list_backups,
+    load_backup,
+    save_backup,
+)
+from xemu_lab.titles import game_display_name
 from xemu_lab.catalog import (
     CatalogEntry,
     HDDCatalog,
@@ -26,11 +37,22 @@ from xemu_lab.qcow2 import (
     QCOW2Error,
     UnsupportedQCOW2Feature,
 )
+from xemu_lab.restore import RestoreError, restore_backup_to_path
+from xemu_lab.safety import (
+    SafetyError,
+    assert_not_golden,
+    assert_xemu_closed,
+    atomic_copy_qcow2,
+    rollback_active_from_golden,
+)
+from xemu_lab.titles import list_games_on_image
 
 
 EXPECTED_GUEST_SIZE = 8 * 1024 * 1024 * 1024
 EXPECTED_QCOW2_CLUSTER_SIZE = 64 * 1024
 PARTITION_E_OFFSET = 0xABE80000
+MERCENARIES_TITLE_ID = "4c410015"
+DEFAULT_CYCLE_SCENARIO = "1"
 
 BLACK_EXPECTED_TOTAL = 64
 BLACK_EXPECTED_CONFIG = 1
@@ -60,20 +82,26 @@ class XemuTestLab:
         while True:
             print()
             print("MENU PRINCIPALE")
-            print("  1. Ciclo test completo                 [BLOCCATO]")
-            print("  2. Solo backup save                    [BLOCCATO]")
-            print("  3. Solo restore save                   [BLOCCATO]")
-            print("  4. Ripristina HDD attivo da golden     [BLOCCATO]")
+            print("  1. Ciclo guidato HDD1 Mercenaries")
+            print("  2. Solo backup save (da golden, rb)")
+            print("  3. Solo restore save (solo HDD attivo)")
+            print("  4. Ripristina HDD attivo da golden")
             print("  5. Analizza/confronta HDD")
             print("  6. Catalogo HDD e risultati")
             print("  0. Esci")
             choice = input("\nScelta: ").strip()
 
             if choice == "0":
-                print("Uscita. Nessun HDD è stato modificato.")
+                print("Uscita.")
                 return
-            if choice in {"1", "2", "3", "4"}:
-                self._show_write_gate()
+            if choice == "1":
+                self._guided_cycle_hdd1()
+            elif choice == "2":
+                self._menu_backup_save()
+            elif choice == "3":
+                self._menu_restore_save()
+            elif choice == "4":
+                self._menu_copy_golden_to_active()
             elif choice == "5":
                 self._analysis_menu()
             elif choice == "6":
@@ -83,22 +111,317 @@ class XemuTestLab:
 
     def _print_banner(self) -> None:
         print("=" * 72)
-        print("XEMU TEST LAB - QCOW2/FATX guest-aware")
+        print("XEMU TEST LAB - QCOW2/FATX guest-aware (QEMU-free)")
         print("=" * 72)
-        print("FASE ATTUALE: sola lettura.")
+        print("FASE ATTUALE: lettura + scrittura overwrite su cluster allocati.")
         print(
-            "Archivio HDD (golden + fixture forensi): "
+            "Archivio HDD (golden, mai in scrittura): "
             f"{self.catalog.config.backup_folder}"
         )
         print(f"HDD attivo:      {self.catalog.config.target_path}")
-        print("Restore, copie e scritture sono disabilitati nel codice.")
+        print(f"Backup v6:       {DEFAULT_BACKUP_DIR}")
+        print("Niente qemu-img. I golden in D:\\xemu\\bk non vengono aperti in scrittura.")
 
-    def _show_write_gate(self) -> None:
+    def _guided_cycle_hdd1(self) -> None:
         print()
-        print("Operazione non disponibile: il gate read-only non è ancora superato.")
-        print("Prima devono passare le verifiche QCOW2/FATX B1/B2 e H1/H2.")
-        print("Non è stata eseguita alcuna scrittura.")
+        print("CICLO GUIDATO HDD1 / Mercenaries")
+        print(
+            "Sequenza: backup da golden → copia su attivo → "
+            "(pausa cancellazione save) → restore → test → rollback opzionale."
+        )
+        try:
+            assert_xemu_closed()
+            golden = self.catalog.find(DEFAULT_CYCLE_SCENARIO)
+            if not golden.exists:
+                raise FileNotFoundError("HDD 1 golden non trovato")
+            active = self.catalog.config.target_path
+            title_id = MERCENARIES_TITLE_ID
+
+            print(f"\n[1/5] Backup {title_id} da {golden.actual_path.name}...")
+            backup = backup_title_id_from_path(golden.actual_path, title_id)
+            bin_path, json_path = save_backup(backup)
+            print(
+                f"  OK: {backup.cluster_count} cluster, "
+                f"{backup.directory_entry_count} dir entries"
+            )
+            print(f"  {bin_path}")
+
+            print(f"\n[2/5] Copia atomica golden → attivo...")
+            copy_report = atomic_copy_qcow2(
+                golden.actual_path,
+                active,
+                self.catalog.config.backup_folder,
+            )
+            print(f"  OK sha256={copy_report.sha256[:16]}...")
+
+            print()
+            print("[3/5] PAUSA MANUALE")
+            print("  1. Avvia xemu sull'HDD attivo appena copiato.")
+            print("  2. Cancella il save di Mercenaries in gioco.")
+            print("  3. Chiudi xemu completamente.")
+            input("Premi INVIO solo quando xemu è chiuso e il save è cancellato...")
+            assert_xemu_closed()
+
+            print(f"\n[4/5] Restore {title_id} sull'HDD attivo...")
+            assert_not_golden(active, self.catalog.config.backup_folder)
+            report = restore_backup_to_path(backup, active, verify=True)
+            print(
+                f"  OK: dir={report.directory_entries}, "
+                f"fat_bytes={report.fat_bytes}, "
+                f"clusters={report.data_clusters}, "
+                f"verified={report.verified}"
+            )
+
+            print()
+            print("[5/5] TEST IN XEMU")
+            print("  Avvia xemu e verifica che Mercenaries carichi il save.")
+            print("  Non usare B1/B2 come golden: questo ciclo usa solo HDD 1.")
+            answer = input(
+                "Rollback (ricopia HDD1 sull'attivo) ora? (s/N): "
+            ).strip().lower()
+            if answer in {"s", "y"}:
+                assert_xemu_closed()
+                rb = rollback_active_from_golden(
+                    golden.actual_path,
+                    active,
+                    self.catalog.config.backup_folder,
+                )
+                print(f"  Rollback OK sha256={rb.sha256[:16]}...")
+                details = (
+                    f"Backup {bin_path.name}",
+                    "Restore completato poi rollback eseguito",
+                )
+            else:
+                details = (
+                    f"Backup {bin_path.name}",
+                    f"Restore verificato su {active.name}",
+                    "Rollback non richiesto",
+                )
+
+            self._record_and_print(
+                LabResult(
+                    timestamp=datetime.now(),
+                    name="Ciclo guidato HDD1 Mercenaries",
+                    passed=True,
+                    details=details,
+                )
+            )
+        except (
+            SafetyError,
+            BackupError,
+            RestoreError,
+            FileNotFoundError,
+            KeyError,
+            OSError,
+            QCOW2Error,
+            FATXError,
+            ValueError,
+        ) as exc:
+            self._record_and_print(
+                LabResult(
+                    timestamp=datetime.now(),
+                    name="Ciclo guidato HDD1 Mercenaries",
+                    passed=False,
+                    details=(f"{type(exc).__name__}: {exc}",),
+                )
+            )
         self._pause()
+
+    def _menu_backup_save(self) -> None:
+        print()
+        print("BACKUP SAVE (golden in sola lettura → XBSV v6)")
+        path = self._select_golden_image("Golden da cui estrarre il save")
+        if path is None:
+            return
+        title_id = self._select_title_id_from_image(path)
+        if title_id is None:
+            return
+        try:
+            backup = backup_title_id_from_path(path, title_id)
+            bin_path, json_path = save_backup(backup)
+            self._record_and_print(
+                LabResult(
+                    timestamp=datetime.now(),
+                    name=f"Backup {title_id}",
+                    passed=True,
+                    details=(
+                        f"Sorgente: {path}",
+                        f"Cluster: {backup.cluster_count}",
+                        f"Dir entries: {backup.directory_entry_count}",
+                        f"File: {bin_path.name}",
+                        f"Meta: {json_path.name}",
+                    ),
+                )
+            )
+        except (BackupError, OSError, QCOW2Error, FATXError, ValueError) as exc:
+            print(f"ERRORE: {type(exc).__name__}: {exc}")
+        self._pause()
+
+    def _select_title_id_from_image(self, path: Path) -> Optional[str]:
+        """Scansiona UDATA e propone i giochi con nome (come il merger v5.5)."""
+
+        print()
+        print(f"Scansione giochi su: {path.name}")
+        try:
+            games = list_games_on_image(path, areas=("UDATA",))
+        except (OSError, QCOW2Error, FATXError, ValueError) as exc:
+            print(f"ERRORE scansione: {type(exc).__name__}: {exc}")
+            return None
+
+        if not games:
+            print("Nessun Title ID trovato in E:\\UDATA.")
+            return None
+
+        print("\nGiochi disponibili:")
+        for index, game in enumerate(games, start=1):
+            print(
+                f"  {index:2}. {game.title_id}: {game.name} "
+                f"(cluster {game.first_cluster})"
+            )
+        print("   0. Annulla")
+        choice = input("Numero gioco: ").strip()
+        if choice == "0" or not choice:
+            return None
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            print("Selezione non valida.")
+            return None
+        if not 0 <= index < len(games):
+            print("Selezione non valida.")
+            return None
+        return games[index].title_id
+
+    def _menu_restore_save(self) -> None:
+        print()
+        print("RESTORE SAVE (solo HDD attivo, overwrite cluster allocati)")
+        active = self.catalog.config.target_path
+        backups = list_backups()
+        if not backups:
+            print(f"Nessun backup v6 in {DEFAULT_BACKUP_DIR}")
+            self._pause()
+            return
+        for index, meta_path in enumerate(backups, start=1):
+            print(f"  {index:2}. {backup_display_label(meta_path)}")
+        print("   0. Annulla")
+        choice = input("Selezione: ").strip()
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            print("Selezione non valida.")
+            self._pause()
+            return
+        if index < 0 or index >= len(backups):
+            print("Annullato.")
+            self._pause()
+            return
+        meta_path = backups[index]
+        try:
+            assert_xemu_closed()
+            assert_not_golden(active, self.catalog.config.backup_folder)
+            info = json.loads(meta_path.read_text(encoding="utf-8"))
+            bin_path = meta_path.with_name(info["bin_file"])
+            backup = load_backup(bin_path, json_path=meta_path)
+            label = backup_display_label(meta_path)
+            print(f"Target: {active}")
+            confirm = input(
+                f"Confermi restore di {label}? (s/N): "
+            ).strip().lower()
+            if confirm not in {"s", "y"}:
+                print("Annullato.")
+                self._pause()
+                return
+            report = restore_backup_to_path(backup, active, verify=True)
+            self._record_and_print(
+                LabResult(
+                    timestamp=datetime.now(),
+                    name=f"Restore {game_display_name(backup.title_id)}",
+                    passed=True,
+                    details=(
+                        f"Target: {active}",
+                        f"Dir={report.directory_entries} "
+                        f"fat_bytes={report.fat_bytes} "
+                        f"clusters={report.data_clusters}",
+                        f"verified={report.verified}",
+                    ),
+                )
+            )
+        except (
+            SafetyError,
+            BackupError,
+            RestoreError,
+            OSError,
+            QCOW2Error,
+            KeyError,
+            ValueError,
+        ) as exc:
+            print(f"ERRORE: {type(exc).__name__}: {exc}")
+        self._pause()
+
+    def _menu_copy_golden_to_active(self) -> None:
+        print()
+        print("COPIA GOLDEN → HDD ATTIVO (atomica + hash)")
+        path = self._select_golden_image("Golden da copiare sull'attivo")
+        if path is None:
+            return
+        active = self.catalog.config.target_path
+        print(f"Destinazione: {active}")
+        confirm = input("Confermi la sovrascrittura dell'HDD attivo? (s/N): ").strip().lower()
+        if confirm not in {"s", "y"}:
+            print("Annullato.")
+            self._pause()
+            return
+        try:
+            report = atomic_copy_qcow2(
+                path,
+                active,
+                self.catalog.config.backup_folder,
+            )
+            self._record_and_print(
+                LabResult(
+                    timestamp=datetime.now(),
+                    name="Copia golden → attivo",
+                    passed=True,
+                    details=(
+                        f"Da: {report.source}",
+                        f"A:  {report.destination}",
+                        f"sha256: {report.sha256}",
+                    ),
+                )
+            )
+        except (SafetyError, OSError) as exc:
+            print(f"ERRORE: {type(exc).__name__}: {exc}")
+        self._pause()
+
+    def _select_golden_image(self, prompt: str) -> Optional[Path]:
+        entries = [
+            entry
+            for entry in self.catalog.entries(include_unregistered=False)
+            if entry.exists and entry.registered
+        ]
+        print()
+        print(prompt)
+        for index, entry in enumerate(entries, start=1):
+            marker = ""
+            if entry.scenario_id in {"b1", "b2"}:
+                marker = " [fixture forense, non usare come golden restore]"
+            print(
+                f"  {index:2}. [{entry.display_id}] "
+                f"{entry.actual_path.name} - {entry.description}{marker}"
+            )
+        print("   0. Annulla")
+        choice = input("Selezione: ").strip()
+        if choice == "0" or not choice:
+            return None
+        try:
+            index = int(choice) - 1
+        except ValueError:
+            print("Selezione non valida.")
+            return None
+        if not 0 <= index < len(entries):
+            print("Selezione non valida.")
+            return None
+        return entries[index].actual_path
 
     def _analysis_menu(self) -> None:
         while True:

@@ -5,8 +5,16 @@ import os
 import struct
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
+from xemu_lab.backup import (
+    GameBackup,
+    deserialize_backup,
+    save_backup,
+    serialize_backup,
+)
 from xemu_lab.catalog import HDDCatalog
 from xemu_lab.compare import compare_paths
 from xemu_lab.fatx import (
@@ -16,10 +24,14 @@ from xemu_lab.fatx import (
 from xemu_lab.qcow2 import (
     QCOW2BlockDevice,
     QCOW2FormatError,
+    QCOW2WritableBlockDevice,
+    QCOW2WriteError,
     QCOW2_MAGIC,
     QCOW_OFLAG_COPIED,
     QCOW_OFLAG_ZERO,
 )
+from xemu_lab.restore import restore_backup_to_path
+from xemu_lab.safety import SafetyError, assert_not_golden, atomic_copy_qcow2
 
 
 BLACK_B1 = Path(r"D:\xemu\bk\xbox_hddB1.qcow2")
@@ -107,6 +119,105 @@ class QCOW2ReaderTests(unittest.TestCase):
         with QCOW2BlockDevice(path) as device:
             with self.assertRaises(QCOW2FormatError):
                 device.read_at(0x2000, 1)
+
+
+class QCOW2WriterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "writable.qcow2"
+        self.path.write_bytes(_make_synthetic_qcow2())
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_overwrite_allocated_cluster(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            device.write_at(0, b"HELLO")
+            device.flush()
+            self.assertEqual(device.read_at(0, 5), b"HELLO")
+            self.assertEqual(device.read_at(5, 1), bytes([5]))
+
+    def test_rejects_unallocated_and_zero_clusters(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            with self.assertRaises(QCOW2WriteError):
+                device.write_at(0x1000, b"X")
+            with self.assertRaises(QCOW2WriteError):
+                device.write_at(0x2000, b"Y")
+
+    def test_write_does_not_change_unrelated_host_clusters(self) -> None:
+        before = self.path.read_bytes()
+        with QCOW2WritableBlockDevice(self.path) as device:
+            device.write_at(0x3000, b"ZZZZ")
+            device.flush()
+        after = bytearray(self.path.read_bytes())
+        # Host cluster at 0x4000 (guest 0) unchanged; guest 0x3000 -> host 0x5000.
+        self.assertEqual(before[0x4000:0x5000], after[0x4000:0x5000])
+        self.assertEqual(after[0x5000:0x5004], b"ZZZZ")
+        self.assertEqual(before[:0x4000], after[:0x4000])
+
+
+class BackupRestoreUnitTests(unittest.TestCase):
+    def test_serialize_roundtrip_and_restore_on_synthetic_qcow2(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        image = Path(temp.name) / "target.qcow2"
+        image.write_bytes(_make_synthetic_qcow2())
+
+        backup = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=image,
+            source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x10, b"E" * 64)],
+            fat_runs=[],
+            data_chunks=[(9, 0x100, b"PAYLOAD!!")],
+        )
+
+        payload = serialize_backup(backup)
+        restored = deserialize_backup(payload)
+        self.assertEqual(restored.title_id, "4c410015")
+        self.assertEqual(restored.data_chunks[0][2], b"PAYLOAD!!")
+
+        bin_path, json_path = save_backup(backup, output_dir=temp.name)
+        self.assertTrue(bin_path.is_file())
+        self.assertTrue(json_path.is_file())
+
+        report = restore_backup_to_path(restored, image, verify=True)
+        self.assertTrue(report.verified)
+        with QCOW2BlockDevice(image) as device:
+            self.assertEqual(device.read_at(0x100, 9), b"PAYLOAD!!")
+            self.assertEqual(device.read_at(0x10, 64), b"E" * 64)
+
+
+class SafetyTests(unittest.TestCase):
+    def test_refuses_copy_into_golden_folder(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "bk"
+        folder.mkdir()
+        source = folder / "golden.qcow2"
+        source.write_bytes(_make_synthetic_qcow2())
+        with self.assertRaises(SafetyError):
+            assert_not_golden(source, folder)
+        dest = folder / "copy.qcow2"
+        with self.assertRaises(SafetyError):
+            atomic_copy_qcow2(source, dest, folder)
+
+    def test_atomic_copy_verifies_hash(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        folder = Path(temp.name) / "bk"
+        folder.mkdir()
+        source = Path(temp.name) / "src.qcow2"
+        dest = Path(temp.name) / "dst.qcow2"
+        source.write_bytes(_make_synthetic_qcow2())
+        with mock.patch("xemu_lab.safety.find_xemu_processes", return_value=[]):
+            report = atomic_copy_qcow2(source, dest, folder)
+        self.assertTrue(dest.is_file())
+        self.assertEqual(report.sha256, hashlib.sha256(source.read_bytes()).hexdigest())
 
 
 class FATXParserTests(unittest.TestCase):
