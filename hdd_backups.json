@@ -95,6 +95,32 @@
                 "Black"
             ],
             "checkpoint": 2
+        },
+        {
+            "id": "t1",
+            "filename": "xbox_hddt1.qcow2",
+            "description": "ToeJam & Earl III - Checkpoint 1",
+            "games": [
+                "ToeJam & Earl III"
+            ],
+            "checkpoint": 1
+        },
+        {
+            "id": "t2",
+            "filename": "xbox_hddt2.qcow2",
+            "description": "ToeJam & Earl III - Checkpoint 2",
+            "games": [
+                "ToeJam & Earl III"
+            ],
+            "checkpoint": 2
+        },
+        {
+            "id": "f",
+            "filename": "xbox_hddf.qcow2",
+            "description": "Forza Horizon",
+            "games": [
+                "Forza Horizon"
+            ]
         }
     ]
 }
