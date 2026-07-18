@@ -294,11 +294,11 @@ class XemuTestLab:
 
     def _menu_restore_save(self) -> None:
         print()
-        print("RESTORE SAVE (solo HDD attivo, overwrite cluster allocati)")
+        print("RESTORE SAVE (solo HDD attivo)")
         active = self.catalog.config.target_path
         backups = list_backups()
         if not backups:
-            print(f"Nessun backup v6 in {DEFAULT_BACKUP_DIR}")
+            print(f"Nessun backup in {DEFAULT_BACKUP_DIR}")
             self._pause()
             return
         for index, meta_path in enumerate(backups, start=1):
@@ -323,26 +323,78 @@ class XemuTestLab:
             bin_path = meta_path.with_name(info["bin_file"])
             backup = load_backup(bin_path, json_path=meta_path)
             label = backup_display_label(meta_path)
+            name = game_display_name(backup.title_id)
             print(f"Target: {active}")
-            confirm = input(
-                f"Confermi restore di {label}? (s/N): "
-            ).strip().lower()
-            if confirm not in {"s", "y"}:
-                print("Annullato.")
-                self._pause()
-                return
-            report = restore_backup_to_path(backup, active, verify=True)
+
+            live_games = list_games_on_image(active, partition=backup.partition)
+            live_ids = {game.title_id.lower() for game in live_games}
+            title_on_live = backup.title_id.lower() in live_ids
+            if live_games:
+                listed = ", ".join(
+                    f"{game.name} ({game.title_id})" for game in live_games
+                )
+                print(f"Giochi sul live (UDATA): {listed}")
+            else:
+                print("Giochi sul live (UDATA): nessuno")
+
+            if not title_on_live:
+                print()
+                print(
+                    f"ATTENZIONE: sul live non risulta {name} "
+                    f"({backup.title_id}). "
+                    "O non c’è, o è un HDD vergine/sparse / altro layout."
+                )
+                print(
+                    "Il restore tenterà comunque (allocate automatico se serve). "
+                    "Su multi-game pieno i cluster FATX del backup possono "
+                    "collidere con altri Title ID (serve remap 6.1)."
+                )
+                proceed = input(
+                    "Continuare lo stesso? (s/N): "
+                ).strip().lower()
+                if proceed not in {"s", "y"}:
+                    print("Annullato.")
+                    self._pause()
+                    return
+            else:
+                confirm = input(
+                    f"Confermi restore di {label}? (s/N): "
+                ).strip().lower()
+                if confirm not in {"s", "y"}:
+                    print("Annullato.")
+                    self._pause()
+                    return
+
+            if not backup.has_qcow2_envelopes:
+                print(
+                    "  Nota: backup senza envelope QCOW2 (v6). "
+                    "Su vergine/sparse meglio rifare backup (v7)."
+                )
+
+            # Allocate sempre consentito: gli envelope si applicano solo
+            # ai cluster non overwrite-safe (parity v6 sugli altri).
+            report = restore_backup_to_path(
+                backup,
+                active,
+                verify=True,
+                allow_allocate=True,
+            )
             self._record_and_print(
                 LabResult(
                     timestamp=datetime.now(),
-                    name=f"Restore {game_display_name(backup.title_id)}",
+                    name=f"Restore {name}",
                     passed=True,
                     details=(
                         f"Target: {active}",
+                        f"title_on_live={title_on_live}",
                         f"Dir={report.directory_entries} "
                         f"fat_bytes={report.fat_bytes} "
                         f"clusters={report.data_clusters}",
                         f"verified={report.verified}",
+                        f"allocate={report.allocate_used} "
+                        f"qcow2_new={report.clusters_allocated} "
+                        f"host_grown={report.host_bytes_grown} "
+                        f"envelopes={report.envelopes_written}",
                     ),
                 )
             )
@@ -354,6 +406,7 @@ class XemuTestLab:
             QCOW2Error,
             KeyError,
             ValueError,
+            FATXError,
         ) as exc:
             print(f"ERRORE: {type(exc).__name__}: {exc}")
         self._pause()

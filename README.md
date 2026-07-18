@@ -1,16 +1,23 @@
 # 🎮 Xbox Save Surgical Restore Tool
 
-## Current status: QEMU-FREE GUEST-AWARE WRITES
+## Current status: QEMU-FREE GUEST-AWARE WRITES (+ allocate opt-in)
 
 The lab maps guest disk offsets through real QCOW2 L1/L2 tables, then backups
-and restores saves with overwrite-only writes on already-allocated host
-clusters. **No qemu-img / QEMU binary is used or required.**
+and restores saves as XBSV v7 (v6 still readable). Default restore is
+overwrite-only on already allocated host clusters. **Allocate-on-write is
+opt-in** (menu confirm) for sparse/virgin targets and uses full QCOW2 cluster
+envelopes so FAT/root sharing the same 64KiB guest cluster are not zeroed —
+still pure Python, still **no qemu-img / QEMU**.
 
 Why QEMU is excluded (project constraint since the early phases): forced Linux
 compatibility rules out shipping a Windows `qemu.exe`; stock `qemu-img convert`
 rebuilt images with wrong sizes; building xemu’s modified QEMU tools from
 source on Ubuntu did not produce usable qemu utilities. Writes go through the
 Python block device in `xemu_lab/qcow2.py` instead.
+
+See `CHAPTER2_GUEST_AWARE_LAB.md` (overwrite era) and
+`CHAPTER3_QCOW2_ALLOCATE.md` (allocate 6.0). FATX cluster remapping is not in
+v1 (planned 6.1).
 
 The old v5/v5.5 merger remains an empirical discovery oracle, but its restore
 path still treats host file offsets as guest offsets and must not be used on
@@ -39,7 +46,9 @@ The current build can:
 - run the guided HDD 1 / Mercenaries cycle.
 
 Golden images under `D:\xemu\bk` are never opened for writing. Allocate-on-write
-(new QCOW2 clusters / L2 updates) is intentionally unsupported in this phase.
+(new QCOW2 clusters / L2 / refcount updates) is available only when explicitly
+confirmed in the restore menu; always run it on a copy or the active HDD, never
+on goldens.
 
 ### Read-only gate result (17 July 2026)
 

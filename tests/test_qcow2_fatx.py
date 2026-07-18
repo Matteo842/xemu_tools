@@ -5,6 +5,7 @@ import os
 import struct
 import tempfile
 import unittest
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,7 @@ from xemu_lab.qcow2 import (
     QCOW2WritableBlockDevice,
     QCOW2WriteError,
     QCOW2_MAGIC,
+    QCOW_OFLAG_COMPRESSED,
     QCOW_OFLAG_COPIED,
     QCOW_OFLAG_ZERO,
 )
@@ -190,6 +192,183 @@ class BackupRestoreUnitTests(unittest.TestCase):
         with QCOW2BlockDevice(image) as device:
             self.assertEqual(device.read_at(0x100, 9), b"PAYLOAD!!")
             self.assertEqual(device.read_at(0x10, 64), b"E" * 64)
+
+
+class QCOW2AllocateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "alloc.qcow2"
+        self.path.write_bytes(_make_synthetic_qcow2_with_refcounts())
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_allocate_unallocated_and_write(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            with self.assertRaises(QCOW2WriteError):
+                device.write_at(0x1000, b"NEW1")
+            device.write_at(0x1000, b"NEW1", allocate=True)
+            self.assertEqual(device.read_at(0x1000, 4), b"NEW1")
+            self.assertGreaterEqual(device.clusters_allocated, 1)
+            self.assertFalse(device.header.is_dirty)
+
+    def test_allocate_zero_cluster(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            self.assertTrue(device.map_cluster(2).reads_as_zero)
+            device.write_at(0x2000, b"ZERO", allocate=True)
+            mapping = device.map_cluster(2)
+            self.assertTrue(mapping.allocated)
+            self.assertFalse(mapping.reads_as_zero)
+            self.assertEqual(device.read_at(0x2000, 4), b"ZERO")
+
+    def test_reallocate_compressed_cluster(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            self.assertTrue(device.is_compressed_cluster(4))
+            device.write_at(0x4000, b"UNC!", allocate=True)
+            self.assertFalse(device.is_compressed_cluster(4))
+            self.assertEqual(device.read_at(0x4000, 4), b"UNC!")
+            # Prefisso sovrascritto; il resto resta il contenuto decompresso.
+            self.assertEqual(device.read_at(0x4004, 4), b"CCCC")
+
+    def test_allocate_creates_missing_l2(self) -> None:
+        # Guest 512 richiede L1[1], inizialmente 0.
+        guest_offset = 512 * 0x1000
+        with QCOW2WritableBlockDevice(self.path) as device:
+            self.assertEqual(device.raw_l2_entry(512), 0)
+            device.write_at(guest_offset, b"L2OK", allocate=True)
+            self.assertEqual(device.read_at(guest_offset, 4), b"L2OK")
+            self.assertNotEqual(device._l1_table[1], 0)
+
+    def test_allocate_false_still_rejects_unallocated(self) -> None:
+        with QCOW2WritableBlockDevice(self.path) as device:
+            with self.assertRaises(QCOW2WriteError):
+                device.write_at(0x1000, b"X", allocate=False)
+
+    def test_restore_with_allow_allocate_on_sparse_target(self) -> None:
+        # Envelope QCOW2 interi: evita di azzerare i byte non chirurgici.
+        with QCOW2WritableBlockDevice(self.path) as device:
+            env1 = bytearray(device.read_cluster_content(1))
+            env2 = bytearray(device.read_cluster_content(2))
+            env4 = bytearray(device.read_cluster_content(4))
+        env1[0:64] = b"D" * 64
+        env2[0:4] = b"FATZ"
+        env4[0:4] = b"COMP"
+        envelopes = [(1, bytes(env1)), (2, bytes(env2)), (4, bytes(env4))]
+
+        backup = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=self.path,
+            source_sha256=hashlib.sha256(self.path.read_bytes()).hexdigest(),
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x1000, b"D" * 64)],
+            fat_runs=[],
+            data_chunks=[
+                (1, 0x2000, b"FATZ"),
+                (2, 0x4000, b"COMP"),
+            ],
+            qcow2_envelopes=envelopes,
+            qcow2_cluster_size=0x1000,
+            format_version=7,
+        )
+        with self.assertRaises(Exception):
+            restore_backup_to_path(backup, self.path, verify=True, allow_allocate=False)
+
+        report = restore_backup_to_path(
+            backup,
+            self.path,
+            verify=False,
+            allow_allocate=True,
+        )
+        self.assertTrue(report.allocate_used)
+        self.assertGreater(report.clusters_allocated, 0)
+        self.assertEqual(report.envelopes_written, 3)
+        with QCOW2BlockDevice(self.path) as device:
+            self.assertEqual(device.read_at(0x1000, 64), b"D" * 64)
+            self.assertEqual(device.read_at(0x2000, 4), b"FATZ")
+            self.assertEqual(device.read_at(0x4000, 4), b"COMP")
+
+    def test_v7_skips_envelopes_on_already_allocated_clusters(self) -> None:
+        """Su cluster già overwrite-safe gli envelope non si applicano (parity v6)."""
+
+        with QCOW2WritableBlockDevice(self.path) as device:
+            env0 = device.read_cluster_content(0)
+        # Payload diverso dall'immagine: se l'envelope venisse scritto, cambierebbe.
+        foreign = bytes([0x5A]) * 0x1000
+        backup = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=self.path,
+            source_sha256="",
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x0, b"E" * 64)],
+            fat_runs=[],
+            data_chunks=[],
+            qcow2_envelopes=[(0, foreign)],
+            qcow2_cluster_size=0x1000,
+            format_version=7,
+        )
+        report = restore_backup_to_path(
+            backup,
+            self.path,
+            verify=False,
+            allow_allocate=True,
+        )
+        self.assertEqual(report.envelopes_written, 0)
+        with QCOW2BlockDevice(self.path) as device:
+            # Solo i 64 byte chirurgici, non l'envelope straniero.
+            self.assertEqual(device.read_at(0, 64), b"E" * 64)
+            self.assertEqual(device.read_at(64, 16), env0[64:80])
+
+    def test_v6_allocate_partial_unalloc_is_rejected(self) -> None:
+        backup = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=self.path,
+            source_sha256="",
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x1000, b"D" * 64)],
+            fat_runs=[],
+            data_chunks=[],
+            format_version=6,
+        )
+        from xemu_lab.restore import RestoreError
+
+        with self.assertRaises(RestoreError) as ctx:
+            restore_backup_to_path(
+                backup,
+                self.path,
+                verify=False,
+                allow_allocate=True,
+            )
+        self.assertIn("envelope", str(ctx.exception).lower())
+
+    def test_serialize_v7_roundtrip_includes_envelopes(self) -> None:
+        backup = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=self.path,
+            source_sha256="ab" * 32,
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x10, b"E" * 64)],
+            fat_runs=[],
+            data_chunks=[(9, 0x100, b"PAYLOAD!!")],
+            qcow2_envelopes=[(0, b"Q" * 0x1000)],
+            qcow2_cluster_size=0x1000,
+            format_version=7,
+        )
+        restored = deserialize_backup(serialize_backup(backup))
+        self.assertEqual(restored.format_version, 7)
+        self.assertEqual(len(restored.qcow2_envelopes), 1)
+        self.assertEqual(restored.qcow2_envelopes[0][1], b"Q" * 0x1000)
 
 
 class SafetyTests(unittest.TestCase):
@@ -384,6 +563,95 @@ def _make_synthetic_qcow2() -> bytes:
 
     image[cluster_size * 4 : cluster_size * 5] = bytes(range(256)) * 16
     image[cluster_size * 5 : cluster_size * 6] = b"D" * cluster_size
+    return bytes(image)
+
+
+def _make_synthetic_qcow2_with_refcounts() -> bytes:
+    """Fixture con refcount coerenti, unalloc/zero/compresso e L1 sparso."""
+
+    cluster_bits = 12
+    cluster_size = 1 << cluster_bits
+    # Host layout:
+    # 0 header, 1 refcount table, 2 refcount block, 3 L1, 4 L2,
+    # 5 data guest0, 6 compressed payload guest4
+    host_clusters = 7
+    image = bytearray(cluster_size * host_clusters)
+    # Guest 0..512 coperti da due entry L1 (512 entry/L2).
+    virtual_size = cluster_size * 513
+    refcount_table_offset = cluster_size * 1
+    refcount_block_offset = cluster_size * 2
+    l1_offset = cluster_size * 3
+    l2_offset = cluster_size * 4
+    data0_offset = cluster_size * 5
+    compressed_host = cluster_size * 6
+
+    struct.pack_into(">I", image, 0, QCOW2_MAGIC)
+    struct.pack_into(">I", image, 4, 3)
+    struct.pack_into(">Q", image, 8, 0)
+    struct.pack_into(">I", image, 16, 0)
+    struct.pack_into(">I", image, 20, cluster_bits)
+    struct.pack_into(">Q", image, 24, virtual_size)
+    struct.pack_into(">I", image, 32, 0)
+    struct.pack_into(">I", image, 36, 2)  # l1_size
+    struct.pack_into(">Q", image, 40, l1_offset)
+    struct.pack_into(">Q", image, 48, refcount_table_offset)
+    struct.pack_into(">I", image, 56, 1)  # refcount_table_clusters
+    struct.pack_into(">I", image, 60, 0)
+    struct.pack_into(">Q", image, 64, 0)
+    struct.pack_into(">Q", image, 72, 0)
+    struct.pack_into(">Q", image, 80, 0)
+    struct.pack_into(">Q", image, 88, 0)
+    struct.pack_into(">I", image, 96, 4)  # refcount_order -> 16-bit
+    struct.pack_into(">I", image, 100, 104)
+
+    struct.pack_into(">Q", image, refcount_table_offset, refcount_block_offset)
+    for host_index in range(host_clusters):
+        struct.pack_into(
+            ">H",
+            image,
+            refcount_block_offset + host_index * 2,
+            1,
+        )
+
+    struct.pack_into(">Q", image, l1_offset, QCOW_OFLAG_COPIED | l2_offset)
+    # L1[1] = 0 → allocate dovrà creare la L2 per guest 512.
+
+    # Guest 0: allocato
+    struct.pack_into(
+        ">Q",
+        image,
+        l2_offset,
+        QCOW_OFLAG_COPIED | data0_offset,
+    )
+    # Guest 1: unallocated
+    struct.pack_into(">Q", image, l2_offset + 8, 0)
+    # Guest 2: zero
+    struct.pack_into(">Q", image, l2_offset + 16, QCOW_OFLAG_ZERO)
+    # Guest 3: allocato (riusa data0 per semplicità di lettura)
+    struct.pack_into(
+        ">Q",
+        image,
+        l2_offset + 24,
+        QCOW_OFLAG_COPIED | data0_offset,
+    )
+
+    plain = b"C" * cluster_size
+    compressor = zlib.compressobj(level=9, wbits=-12)
+    compressed = compressor.compress(plain) + compressor.flush()
+    image[compressed_host : compressed_host + len(compressed)] = compressed
+    size_bits = cluster_bits - 8
+    csize_shift = 62 - size_bits
+    sectors = (len(compressed) + 511) // 512
+    additional_sectors = max(0, sectors - 1)
+    compressed_entry = (
+        QCOW_OFLAG_COMPRESSED
+        | (additional_sectors << csize_shift)
+        | compressed_host
+    )
+    # Guest 4: compresso
+    struct.pack_into(">Q", image, l2_offset + 32, compressed_entry)
+
+    image[data0_offset : data0_offset + cluster_size] = bytes(range(256)) * 16
     return bytes(image)
 
 

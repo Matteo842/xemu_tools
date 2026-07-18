@@ -1,18 +1,28 @@
-"""Lettore QCOW2 strettamente read-only.
+"""Block device QCOW2 guest-aware (lettura + overwrite + allocate opt-in).
 
 Il resto del progetto deve ragionare esclusivamente in offset del disco guest.
 Questo modulo è l'unico punto che traduce tali offset in posizioni del
-contenitore QCOW2.
+contenitore QCOW2. Allocate-on-write (L2/refcount) è opt-in e senza QEMU.
 """
 
 from __future__ import annotations
 
 import os
 import struct
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional, Protocol, Tuple, Union
+from contextlib import contextmanager
+from typing import (
+    BinaryIO,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+)
 
 
 PathLike = Union[str, os.PathLike]
@@ -539,16 +549,39 @@ class QCOW2BlockDevice:
             raise QCOW2Error("Block device non aperto; usare il context manager")
 
 
-class QCOW2WritableBlockDevice(QCOW2BlockDevice):
-    """Block device QCOW2 con overwrite guest-aware, senza allocate-on-write.
+def _decompress_qcow2_cluster(payload: bytes) -> bytes:
+    """Decomprime un cluster QCOW2 (raw deflate o zlib wrapper)."""
 
-    Scrive solo su cluster host già allocati, non zero e non compressi.
-    Non crea cluster, non aggiorna L2/refcount e non supporta overlay.
+    last_error: Optional[BaseException] = None
+    for wbits in (-12, -15, 15):
+        try:
+            return zlib.decompress(payload, wbits=wbits)
+        except zlib.error as exc:
+            last_error = exc
+    try:
+        return zlib.decompress(payload)
+    except zlib.error as exc:
+        last_error = exc
+    raise QCOW2FormatError(
+        f"Decompressione cluster fallita: {last_error}"
+    ) from last_error
+
+
+class QCOW2WritableBlockDevice(QCOW2BlockDevice):
+    """Block device QCOW2 con overwrite guest-aware e allocate-on-write opt-in.
+
+    Di default scrive solo su cluster host già allocati, non zero e non
+    compressi. Con ``allocate=True`` (o ``ensure_allocated``) crea cluster
+    host, aggiorna L2/L1/refcount e può decomprimere cluster zlib default.
     """
 
     def __init__(self, path: PathLike):
         super().__init__(path)
         self._writable = False
+        self._refcount_table: List[int] = []
+        self._clusters_allocated = 0
+        self._host_bytes_grown = 0
+        self._metadata_dirty = False
 
     def __enter__(self) -> "QCOW2WritableBlockDevice":
         return self.open()
@@ -572,6 +605,10 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
                 raise QCOW2WriteError(
                     "QCOW2 con dirty bit: scrittura rifiutata"
                 )
+            self._refcount_table = list(self._read_refcount_table())
+            self._clusters_allocated = 0
+            self._host_bytes_grown = 0
+            self._metadata_dirty = False
         except Exception:
             self.close()
             raise
@@ -579,10 +616,26 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
 
     def close(self) -> None:
         self._writable = False
+        self._refcount_table = []
+        self._metadata_dirty = False
         super().close()
 
-    def write_at(self, offset: int, data: bytes) -> None:
-        """Sovrascrive byte guest solo dove il mapping host è già allocato."""
+    @property
+    def clusters_allocated(self) -> int:
+        return self._clusters_allocated
+
+    @property
+    def host_bytes_grown(self) -> int:
+        return self._host_bytes_grown
+
+    def write_at(
+        self,
+        offset: int,
+        data: bytes,
+        *,
+        allocate: bool = False,
+    ) -> None:
+        """Sovrascrive byte guest; con allocate=True crea cluster mancanti."""
 
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("I dati da scrivere devono essere bytes-like")
@@ -592,7 +645,7 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
         if not payload:
             return
 
-        # Pre-flight: nessun cluster deve richiedere allocazione.
+        guest_clusters: List[int] = []
         cursor = 0
         while cursor < len(payload):
             guest_offset = offset + cursor
@@ -602,9 +655,130 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
                 len(payload) - cursor,
                 self.cluster_size - in_cluster,
             )
-            self._require_writable_mapping(guest_cluster)
+            guest_clusters.append(guest_cluster)
             cursor += chunk_size
 
+        if allocate:
+            nested = self._metadata_dirty
+            if not nested:
+                self._begin_metadata_mutation()
+            try:
+                for guest_cluster in guest_clusters:
+                    self.ensure_allocated(guest_cluster)
+                self._write_payload_chunks(offset, payload)
+                if not nested:
+                    self.flush()
+            finally:
+                if not nested:
+                    self._end_metadata_mutation()
+            return
+
+        for guest_cluster in guest_clusters:
+            self._require_writable_mapping(guest_cluster)
+        self._write_payload_chunks(offset, payload)
+
+    def needs_allocation(self, guest_cluster: int) -> bool:
+        """True se il cluster non è overwrite-safe (unalloc/zero/compresso)."""
+
+        self._require_open()
+        if self.is_compressed_cluster(guest_cluster):
+            return True
+        mapping = self.map_cluster(guest_cluster)
+        return (not mapping.allocated) or mapping.reads_as_zero
+
+    def read_cluster_content(self, guest_cluster: int) -> bytes:
+        """Legge un cluster guest, decomprimendo se necessario."""
+
+        self._require_open()
+        if self.is_compressed_cluster(guest_cluster):
+            compressed = self.read_compressed_payload(guest_cluster)
+            data = _decompress_qcow2_cluster(compressed)
+            if len(data) != self.cluster_size:
+                raise QCOW2FormatError(
+                    f"Cluster compresso {guest_cluster}: "
+                    f"attesi {self.cluster_size} byte, ottenuti {len(data)}"
+                )
+            return data
+        mapping = self.map_cluster(guest_cluster)
+        if not mapping.allocated or mapping.reads_as_zero:
+            return bytes(self.cluster_size)
+        return self.read_cluster(guest_cluster)
+
+    def write_guest_cluster(
+        self,
+        guest_cluster: int,
+        data: bytes,
+        *,
+        allocate: bool = False,
+    ) -> None:
+        """Scrive un intero cluster QCOW2 guest (allocate opt-in)."""
+
+        if len(data) != self.cluster_size:
+            raise ValueError(
+                f"write_guest_cluster richiede {self.cluster_size} byte, "
+                f"ne ha {len(data)}"
+            )
+        self.write_at(
+            guest_cluster * self.cluster_size,
+            data,
+            allocate=allocate,
+        )
+
+    def ensure_allocated(self, guest_cluster: int) -> ClusterMapping:
+        """Garantisce un cluster guest normale allocato e scrivibile."""
+
+        self._require_writable()
+        if not isinstance(guest_cluster, int) or guest_cluster < 0:
+            raise ValueError("Il numero del cluster guest deve essere >= 0")
+        if guest_cluster >= self.cluster_count:
+            raise ValueError("Cluster guest oltre la dimensione virtuale")
+        if self.header.snapshot_count:
+            raise UnsupportedQCOW2Feature(
+                "Allocate-on-write non supportato con snapshot QCOW2"
+            )
+        if self.header.compression_type != 0:
+            raise UnsupportedQCOW2Feature(
+                "Compressione QCOW2 non-default non supportata in allocate"
+            )
+
+        if self.is_compressed_cluster(guest_cluster):
+            return self._reallocate_compressed_cluster(guest_cluster)
+
+        mapping = self.map_cluster(guest_cluster)
+        if mapping.allocated and not mapping.reads_as_zero:
+            if mapping.host_offset is None:
+                raise QCOW2WriteError(
+                    f"Cluster guest {guest_cluster} senza offset host"
+                )
+            return mapping
+
+        return self._allocate_normal_cluster(
+            guest_cluster,
+            initial_data=bytes(self.cluster_size),
+        )
+
+    def flush(self) -> None:
+        self._require_writable()
+        assert self._file is not None
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    @contextmanager
+    def allocating(self) -> Iterator["QCOW2WritableBlockDevice"]:
+        """Sessione di mutazione metadati (dirty bit + flush finale)."""
+
+        nested = self._metadata_dirty
+        if not nested:
+            self._begin_metadata_mutation()
+        try:
+            yield self
+            if not nested:
+                self.flush()
+        finally:
+            if not nested:
+                self._end_metadata_mutation()
+
+    def _write_payload_chunks(self, offset: int, payload: bytes) -> None:
         cursor = 0
         while cursor < len(payload):
             guest_offset = offset + cursor
@@ -622,12 +796,6 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
             )
             cursor += chunk_size
 
-    def flush(self) -> None:
-        self._require_writable()
-        assert self._file is not None
-        self._file.flush()
-        os.fsync(self._file.fileno())
-
     def _require_writable(self) -> None:
         self._require_open()
         if not self._writable:
@@ -637,13 +805,13 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
         if self.is_compressed_cluster(guest_cluster):
             raise UnsupportedQCOW2Feature(
                 f"Cluster guest {guest_cluster} compresso: "
-                "scrittura non supportata"
+                "scrittura non supportata (usa allocate=True)"
             )
         mapping = self.map_cluster(guest_cluster)
         if not mapping.allocated or mapping.reads_as_zero:
             raise QCOW2WriteError(
                 f"Cluster guest {guest_cluster} non allocato o zero: "
-                "allocate-on-write non supportato"
+                "allocate-on-write non attivo (usa allocate=True)"
             )
         if mapping.host_offset is None:
             raise QCOW2WriteError(
@@ -651,15 +819,301 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
             )
         return mapping
 
+    def _reallocate_compressed_cluster(
+        self,
+        guest_cluster: int,
+    ) -> ClusterMapping:
+        compressed = self.read_compressed_payload(guest_cluster)
+        decompressed = _decompress_qcow2_cluster(compressed)
+        if len(decompressed) != self.cluster_size:
+            raise QCOW2FormatError(
+                f"Cluster compresso {guest_cluster}: "
+                f"attesi {self.cluster_size} byte, "
+                f"ottenuti {len(decompressed)}"
+            )
+        # Il payload compresso precedente resta orfano (leak voluto in v1).
+        return self._allocate_normal_cluster(
+            guest_cluster,
+            initial_data=decompressed,
+        )
+
+    def _allocate_normal_cluster(
+        self,
+        guest_cluster: int,
+        initial_data: bytes,
+    ) -> ClusterMapping:
+        if len(initial_data) != self.cluster_size:
+            raise ValueError("initial_data deve essere esattamente un cluster")
+
+        self._ensure_l2_table(guest_cluster)
+        host_offset = self._alloc_host_clusters(1)
+        self._write_exact_host(host_offset, initial_data)
+        self._set_l2_entry(
+            guest_cluster,
+            QCOW_OFLAG_COPIED | host_offset,
+        )
+        self._clusters_allocated += 1
+        guest_offset = guest_cluster * self.cluster_size
+        return ClusterMapping(
+            guest_cluster,
+            guest_offset,
+            host_offset,
+            allocated=True,
+            reads_as_zero=False,
+        )
+
+    def _ensure_l2_table(self, guest_cluster: int) -> None:
+        entries_per_l2 = self.cluster_size // 8
+        l1_index = guest_cluster // entries_per_l2
+        if l1_index >= len(self._l1_table):
+            raise QCOW2FormatError("Indice L1 oltre la tabella")
+
+        l1_entry = self._l1_table[l1_index]
+        if l1_entry != 0:
+            return
+
+        l2_offset = self._alloc_host_clusters(1)
+        self._write_exact_host(l2_offset, bytes(self.cluster_size))
+        new_entry = QCOW_OFLAG_COPIED | l2_offset
+        self._set_l1_entry(l1_index, new_entry)
+
+    def _set_l1_entry(self, l1_index: int, entry: int) -> None:
+        table = list(self._l1_table)
+        table[l1_index] = entry
+        self._l1_table = tuple(table)
+        offset = self.header.l1_table_offset + l1_index * 8
+        self._write_exact_host(offset, struct.pack(">Q", entry))
+        self._l2_cache.pop(l1_index, None)
+
+    def _set_l2_entry(self, guest_cluster: int, entry: int) -> None:
+        entries_per_l2 = self.cluster_size // 8
+        l1_index, l2_index = divmod(guest_cluster, entries_per_l2)
+        l1_entry = self._l1_table[l1_index]
+        if l1_entry == 0:
+            raise QCOW2WriteError(
+                f"Tabella L2 assente per cluster guest {guest_cluster}"
+            )
+        l2_table_offset = l1_entry & QCOW_OFFSET_MASK
+        self._write_exact_host(
+            l2_table_offset + l2_index * 8,
+            struct.pack(">Q", entry),
+        )
+        self._l2_cache.pop(l1_index, None)
+
+    def _read_refcount_table(self) -> Tuple[int, ...]:
+        header = self.header
+        if header.refcount_table_offset == 0 or header.refcount_table_clusters <= 0:
+            raise QCOW2FormatError("Tabella refcount assente")
+        byte_count = header.refcount_table_clusters * self.cluster_size
+        if header.refcount_table_offset + byte_count > self._host_size:
+            raise QCOW2FormatError("Tabella refcount troncata")
+        raw = self._read_exact_host(header.refcount_table_offset, byte_count)
+        count = byte_count // 8
+        return struct.unpack(f">{count}Q", raw)
+
+    @property
+    def _refcount_bits(self) -> int:
+        return 1 << self.header.refcount_order
+
+    @property
+    def _refcount_block_entries(self) -> int:
+        return (self.cluster_size * 8) // self._refcount_bits
+
+    def _alloc_host_clusters(self, count: int) -> int:
+        if count <= 0:
+            raise ValueError("count deve essere >= 1")
+        self._align_host_size()
+        offset = self._host_size
+        self._append_raw_clusters(count)
+        for index in range(count):
+            self._set_refcount(offset + index * self.cluster_size, 1)
+        return offset
+
+    def _align_host_size(self) -> None:
+        remainder = self._host_size % self.cluster_size
+        if remainder:
+            self._append_raw_bytes(self.cluster_size - remainder)
+
+    def _append_raw_clusters(self, count: int) -> int:
+        offset = self._host_size
+        self._append_raw_bytes(count * self.cluster_size)
+        return offset
+
+    def _append_raw_bytes(self, size: int) -> None:
+        if size <= 0:
+            return
+        assert self._file is not None
+        self._file.seek(0, os.SEEK_END)
+        self._file.write(bytes(size))
+        self._host_size += size
+        self._host_bytes_grown += size
+
+    def _set_refcount(self, host_offset: int, value: int) -> None:
+        if host_offset % self.cluster_size:
+            raise QCOW2FormatError(
+                f"Offset refcount non allineato: 0x{host_offset:x}"
+            )
+        if value < 0 or value >= (1 << self._refcount_bits):
+            raise QCOW2WriteError(f"Valore refcount non valido: {value}")
+
+        cluster_index = host_offset // self.cluster_size
+        entries = self._refcount_block_entries
+        table_index = cluster_index // entries
+        block_index = cluster_index % entries
+
+        while table_index >= len(self._refcount_table):
+            self._grow_refcount_table()
+
+        block_offset = self._refcount_table[table_index] & QCOW_OFFSET_MASK
+        if block_offset == 0:
+            block_offset = self._allocate_refcount_block(table_index)
+
+        self._write_refcount_entry(block_offset, block_index, value)
+
+    def _allocate_refcount_block(self, table_index: int) -> int:
+        block_offset = self._append_raw_clusters(1)
+        self._write_exact_host(block_offset, bytes(self.cluster_size))
+        self._refcount_table[table_index] = block_offset
+        self._persist_refcount_table_entry(table_index, block_offset)
+
+        # Il blocco deve contare se stesso (refcount=1).
+        block_cluster = block_offset // self.cluster_size
+        entries = self._refcount_block_entries
+        block_table_index = block_cluster // entries
+        block_in_block = block_cluster % entries
+        if block_table_index == table_index:
+            self._write_refcount_entry(block_offset, block_in_block, 1)
+        else:
+            self._set_refcount(block_offset, 1)
+        return block_offset
+
+    def _grow_refcount_table(self) -> None:
+        """Allarga la refcount table (vecchia tabella lasciata orfana)."""
+
+        header = self.header
+        entries_per_cluster = self.cluster_size // 8
+        old_clusters = header.refcount_table_clusters
+        new_clusters = old_clusters + 1
+        new_offset = self._append_raw_clusters(new_clusters)
+        old_raw = self._read_exact_host(
+            header.refcount_table_offset,
+            old_clusters * self.cluster_size,
+        )
+        self._write_exact_host(new_offset, old_raw)
+        padding = (new_clusters - old_clusters) * self.cluster_size
+        if padding:
+            self._write_exact_host(
+                new_offset + len(old_raw),
+                bytes(padding),
+            )
+
+        # Aggiorna header: offset + numero cluster tabella.
+        assert self._file is not None
+        self._write_exact_host(48, struct.pack(">Q", new_offset))
+        self._write_exact_host(56, struct.pack(">I", new_clusters))
+        self._header = self._read_header()
+
+        new_entries = new_clusters * entries_per_cluster
+        extended = list(self._refcount_table)
+        while len(extended) < new_entries:
+            extended.append(0)
+        self._refcount_table = extended
+
+        for index in range(new_clusters):
+            self._set_refcount(new_offset + index * self.cluster_size, 1)
+
+    def _persist_refcount_table_entry(
+        self,
+        table_index: int,
+        entry: int,
+    ) -> None:
+        offset = self.header.refcount_table_offset + table_index * 8
+        self._write_exact_host(offset, struct.pack(">Q", entry))
+
+    def _write_refcount_entry(
+        self,
+        block_offset: int,
+        block_index: int,
+        value: int,
+    ) -> None:
+        bits = self._refcount_bits
+        if bits == 16:
+            data = struct.pack(">H", value)
+            byte_offset = block_offset + block_index * 2
+        elif bits == 32:
+            data = struct.pack(">I", value)
+            byte_offset = block_offset + block_index * 4
+        elif bits == 64:
+            data = struct.pack(">Q", value)
+            byte_offset = block_offset + block_index * 8
+        elif bits == 8:
+            data = bytes((value,))
+            byte_offset = block_offset + block_index
+        else:
+            raise UnsupportedQCOW2Feature(
+                f"refcount_order={self.header.refcount_order} "
+                "non supportato in scrittura"
+            )
+        self._write_exact_host(byte_offset, data)
+
+    def _begin_metadata_mutation(self) -> None:
+        if self._metadata_dirty:
+            return
+        self._set_dirty_bit(True)
+        self._metadata_dirty = True
+
+    def _end_metadata_mutation(self) -> None:
+        if not self._metadata_dirty:
+            return
+        self.flush()
+        self._set_dirty_bit(False)
+        self._metadata_dirty = False
+        self.flush()
+
+    def _set_dirty_bit(self, dirty: bool) -> None:
+        if self.header.version < 3:
+            return
+        features = self.header.incompatible_features
+        if dirty:
+            features |= QCOW2_INCOMPAT_DIRTY
+        else:
+            features &= ~QCOW2_INCOMPAT_DIRTY
+        self._write_exact_host(72, struct.pack(">Q", features))
+        # Aggiorna header in memoria senza rileggere tutto il file.
+        assert self._header is not None
+        self._header = QCOW2Header(
+            version=self._header.version,
+            backing_file_offset=self._header.backing_file_offset,
+            backing_file_size=self._header.backing_file_size,
+            cluster_bits=self._header.cluster_bits,
+            cluster_size=self._header.cluster_size,
+            virtual_size=self._header.virtual_size,
+            crypt_method=self._header.crypt_method,
+            l1_size=self._header.l1_size,
+            l1_table_offset=self._header.l1_table_offset,
+            refcount_table_offset=self._header.refcount_table_offset,
+            refcount_table_clusters=self._header.refcount_table_clusters,
+            snapshot_count=self._header.snapshot_count,
+            snapshots_offset=self._header.snapshots_offset,
+            incompatible_features=features,
+            compatible_features=self._header.compatible_features,
+            autoclear_features=self._header.autoclear_features,
+            refcount_order=self._header.refcount_order,
+            header_length=self._header.header_length,
+            compression_type=self._header.compression_type,
+        )
+
     def _write_exact_host(self, offset: int, data: bytes) -> None:
         self._require_writable()
         size = len(data)
-        if offset < 0 or size < 0 or offset > self._host_size:
+        if offset < 0 or size < 0:
             raise QCOW2FormatError("Intervallo host non valido in scrittura")
+        if offset > self._host_size:
+            raise QCOW2FormatError("Scrittura oltre la fine del file host")
         if size > self._host_size - offset:
             raise QCOW2FormatError(
                 "Scrittura oltre la fine del file host "
-                "(niente crescita file in questa fase)"
+                "(estendere prima con allocate)"
             )
 
         assert self._file is not None

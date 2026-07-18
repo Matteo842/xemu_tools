@@ -1,4 +1,4 @@
-"""Backup chirurgico guest-aware di un Title ID FATX (XBSV v6)."""
+"""Backup chirurgico guest-aware di un Title ID FATX (XBSV v6/v7)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ from .titles import game_display_name
 PathLike = Union[str, Path]
 
 XBSV_MAGIC = b"XBSV"
-XBSV_VERSION = 6
+XBSV_VERSION = 7
+XBSV_MIN_READ_VERSION = 6
 DEFAULT_BACKUP_DIR = Path(__file__).resolve().parent.parent / "surgical_backups_v6"
 
 
@@ -41,6 +42,10 @@ class GameBackup:
     # (first_cluster, guest_offset, blob)
     data_chunks: List[Tuple[int, int, bytes]] = field(default_factory=list)
     # (fatx_cluster, guest_offset, payload)
+    qcow2_envelopes: List[Tuple[int, bytes]] = field(default_factory=list)
+    # (qcow2_guest_cluster, full_cluster_bytes)
+    qcow2_cluster_size: int = 0
+    format_version: int = XBSV_VERSION
 
     @property
     def cluster_count(self) -> int:
@@ -50,6 +55,10 @@ class GameBackup:
     def directory_entry_count(self) -> int:
         return len(self.directory_entries)
 
+    @property
+    def has_qcow2_envelopes(self) -> bool:
+        return bool(self.qcow2_envelopes)
+
 
 def backup_title_id(
     device: BlockDevice,
@@ -58,7 +67,7 @@ def backup_title_id(
     partition: str = "E",
     areas: Sequence[str] = ("UDATA",),
 ) -> GameBackup:
-    """Estrae directory entries, FAT e cluster dati di un Title ID."""
+    """Estrae directory entries, FAT, cluster dati e envelope QCOW2."""
 
     normalized = title_id.strip().lower()
     if len(normalized) != 8:
@@ -116,6 +125,19 @@ def backup_title_id(
             )
         )
 
+    ranges: List[Tuple[int, int]] = []
+    for guest_offset, raw in directory_entries:
+        ranges.append((guest_offset, len(raw)))
+    for _first, guest_offset, blob in fat_runs:
+        ranges.append((guest_offset, len(blob)))
+    for _cluster, guest_offset, payload in data_chunks:
+        ranges.append((guest_offset, len(payload)))
+
+    qcow2_cluster_size = int(getattr(device, "cluster_size", 0) or 0)
+    envelopes: List[Tuple[int, bytes]] = []
+    if qcow2_cluster_size > 0:
+        envelopes = _collect_qcow2_envelopes(device, ranges, qcow2_cluster_size)
+
     source = Path(source_path)
     return GameBackup(
         title_id=normalized,
@@ -128,6 +150,9 @@ def backup_title_id(
         directory_entries=directory_entries,
         fat_runs=fat_runs,
         data_chunks=data_chunks,
+        qcow2_envelopes=envelopes,
+        qcow2_cluster_size=qcow2_cluster_size,
+        format_version=XBSV_VERSION,
     )
 
 
@@ -152,7 +177,7 @@ def save_backup(
     backup: GameBackup,
     output_dir: PathLike = DEFAULT_BACKUP_DIR,
 ) -> Tuple[Path, Path]:
-    """Serializza XBSV v6 + sidecar JSON. Restituisce (bin_path, json_path)."""
+    """Serializza XBSV + sidecar JSON. Restituisce (bin_path, json_path)."""
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -167,7 +192,7 @@ def save_backup(
 
     meta = {
         "format": "XBSV",
-        "version": XBSV_VERSION,
+        "version": backup.format_version,
         "title_id": backup.title_id,
         "game_name": game_name,
         "partition": backup.partition,
@@ -179,6 +204,8 @@ def save_backup(
         "directory_entries": backup.directory_entry_count,
         "fat_runs": len(backup.fat_runs),
         "data_clusters": backup.cluster_count,
+        "qcow2_envelopes": len(backup.qcow2_envelopes),
+        "qcow2_cluster_size": backup.qcow2_cluster_size,
         "bin_file": bin_path.name,
         "sha256": digest,
         "guest_offsets_only": True,
@@ -192,10 +219,15 @@ def save_backup(
 
 
 def serialize_backup(backup: GameBackup) -> bytes:
-    parts = [bytearray()]
-    header = parts[0]
+    version = backup.format_version or XBSV_VERSION
+    if backup.qcow2_envelopes and version < 7:
+        version = 7
+    if version < 7:
+        version = 6
+
+    header = bytearray()
     header.extend(XBSV_MAGIC)
-    header.extend(struct.pack("<I", XBSV_VERSION))
+    header.extend(struct.pack("<I", version))
     title = backup.title_id.encode("ascii")
     if len(title) != 8:
         raise BackupError("Title ID deve essere ASCII da 8 caratteri")
@@ -231,6 +263,18 @@ def serialize_backup(backup: GameBackup) -> bytes:
         header.extend(struct.pack("<I", len(payload)))
         header.extend(payload)
 
+    if version >= 7:
+        header.extend(struct.pack("<I", backup.qcow2_cluster_size))
+        header.extend(struct.pack("<I", len(backup.qcow2_envelopes)))
+        for guest_cluster, payload in backup.qcow2_envelopes:
+            if backup.qcow2_cluster_size and len(payload) != backup.qcow2_cluster_size:
+                raise BackupError(
+                    "Envelope QCOW2 con dimensione non coerente"
+                )
+            header.extend(struct.pack("<I", guest_cluster))
+            header.extend(struct.pack("<I", len(payload)))
+            header.extend(payload)
+
     return bytes(header)
 
 
@@ -259,7 +303,7 @@ def deserialize_backup(
     if payload[:4] != XBSV_MAGIC:
         raise BackupError("Magic XBSV assente")
     version = struct.unpack_from("<I", payload, 4)[0]
-    if version != XBSV_VERSION:
+    if version < XBSV_MIN_READ_VERSION or version > XBSV_VERSION:
         raise BackupError(f"Versione backup non supportata: {version}")
 
     title_id = payload[8:16].decode("ascii")
@@ -320,6 +364,25 @@ def deserialize_backup(
         cursor += size
         data_chunks.append((cluster, guest_offset, data))
 
+    qcow2_cluster_size = 0
+    envelopes: List[Tuple[int, bytes]] = []
+    if version >= 7:
+        need(8)
+        qcow2_cluster_size = struct.unpack_from("<I", payload, cursor)[0]
+        cursor += 4
+        env_count = struct.unpack_from("<I", payload, cursor)[0]
+        cursor += 4
+        for _ in range(env_count):
+            need(8)
+            guest_cluster = struct.unpack_from("<I", payload, cursor)[0]
+            cursor += 4
+            size = struct.unpack_from("<I", payload, cursor)[0]
+            cursor += 4
+            need(size)
+            blob = payload[cursor : cursor + size]
+            cursor += size
+            envelopes.append((guest_cluster, blob))
+
     if cursor != len(payload):
         raise BackupError(
             f"Byte residui nel backup: {len(payload) - cursor}"
@@ -336,11 +399,14 @@ def deserialize_backup(
         directory_entries=directory_entries,
         fat_runs=fat_runs,
         data_chunks=data_chunks,
+        qcow2_envelopes=envelopes,
+        qcow2_cluster_size=qcow2_cluster_size,
+        format_version=version,
     )
 
 
 def list_backups(directory: PathLike = DEFAULT_BACKUP_DIR) -> List[Path]:
-    """Elenca i sidecar JSON XBSV v6 (nomi leggibili o legacy title_id)."""
+    """Elenca i sidecar JSON XBSV v6/v7."""
 
     folder = Path(directory)
     if not folder.is_dir():
@@ -351,7 +417,10 @@ def list_backups(directory: PathLike = DEFAULT_BACKUP_DIR) -> List[Path]:
             meta = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if meta.get("format") == "XBSV" and int(meta.get("version", 0)) == XBSV_VERSION:
+        if meta.get("format") != "XBSV":
+            continue
+        version = int(meta.get("version", 0))
+        if XBSV_MIN_READ_VERSION <= version <= XBSV_VERSION:
             results.append(path)
     return sorted(results, key=lambda p: p.stat().st_mtime)
 
@@ -377,9 +446,38 @@ def backup_display_label(json_path: PathLike) -> str:
             stamp = created.astimezone().strftime("%d/%m/%y %H:%M")
         except ValueError:
             stamp = ""
+    version = meta.get("version")
+    suffix = f" v{version}" if version else ""
     if stamp:
-        return f"{name} ({stamp})"
-    return name
+        return f"{name} ({stamp}){suffix}"
+    return f"{name}{suffix}"
+
+
+def _collect_qcow2_envelopes(
+    device: BlockDevice,
+    ranges: Sequence[Tuple[int, int]],
+    cluster_size: int,
+) -> List[Tuple[int, bytes]]:
+    """Copia i cluster QCOW2 interi toccati dai range chirurgici."""
+
+    touched: Set[int] = set()
+    for offset, size in ranges:
+        if size <= 0:
+            continue
+        start = offset // cluster_size
+        end = (offset + size - 1) // cluster_size
+        touched.update(range(start, end + 1))
+
+    envelopes: List[Tuple[int, bytes]] = []
+    for guest_cluster in sorted(touched):
+        guest_offset = guest_cluster * cluster_size
+        payload = device.read_at(guest_offset, cluster_size)
+        if len(payload) != cluster_size:
+            raise BackupError(
+                f"Lettura envelope QCOW2 {guest_cluster} incompleta"
+            )
+        envelopes.append((guest_cluster, payload))
+    return envelopes
 
 
 def _backup_filename_stem(
