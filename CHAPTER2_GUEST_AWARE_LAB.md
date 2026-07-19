@@ -97,22 +97,18 @@ Resoconto tecnico allocate / v7: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALL
 - Halo (centinaia di cluster) e Black checkpoint passano sullo stesso motore di Mercenaries/ToeJam.
 - Con XBSV v7 + allocate: restore Black su HDD vergine/sparse **funziona in gioco** (non solo read-back lab).
 
-**Non dimostra**
+**Non dimostra** (all’epoca del cap. 2)
 
-- Che la size host post-lab sia già identica al golden (può crescere al primo boot xemu).
-- Remap FATX se i cluster del backup sono già occupati da altri Title ID (fase **6.1**).
-- Che `verified=True` da solo basti senza conferma in xemu — sul vergine v7 c’è conferma gameplay.
+- Remap FATX su cluster già usati da altri Title ID → risolto in
+  [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md).
+- Che `verified=True` da solo basti senza conferma in xemu.
 
 ---
 
-## 6. Prossimi stress / fase successiva
+## 6. Prossimi stress / fasi successive
 
-Documentazione allocate: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md). Remap FATX = **6.1**.
-
-Stress candidato (non ancora fatto): HDD multi-game + restore di un Title ID
-**assente** sul target (same-guest / senza remap). Se i cluster FATX del backup
-sono liberi può funzionare; se sono già usati da altri giochi → collisione
-(serve 6.1).
+- Allocate QCOW2: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md)
+- Remap FATX 6.1: [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) (PASS umano 19/07/2026)
 
 ---
 
@@ -134,6 +130,7 @@ tests/test_qcow2_fatx.py
 surgical_backups_v6/   # output backup (gitignore)
 CHAPTER2_GUEST_AWARE_LAB.md   # questo resoconto
 CHAPTER3_QCOW2_ALLOCATE.md    # fase 6.0 allocate-on-write
+CHAPTER4_FATX_REMAP.md        # fase 6.1 remap FATX
 ```
 
 Non usare come specifica operativa: `AI_REFERENCE_SESSION1.md` … `SESSION8.md` (era v5 / offset fisici).

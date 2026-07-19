@@ -1,23 +1,17 @@
 # 🎮 Xbox Save Surgical Restore Tool
 
-## Current status: QEMU-FREE GUEST-AWARE WRITES (+ allocate opt-in)
+## Current status: QEMU-FREE UNIVERSAL SURGICAL RESTORE
 
-The lab maps guest disk offsets through real QCOW2 L1/L2 tables, then backups
-and restores saves as XBSV v7 (v6 still readable). Default restore is
-overwrite-only on already allocated host clusters. **Allocate-on-write is
-opt-in** (menu confirm) for sparse/virgin targets and uses full QCOW2 cluster
-envelopes so FAT/root sharing the same 64KiB guest cluster are not zeroed —
-still pure Python, still **no qemu-img / QEMU**.
+Guest-aware QCOW2 L1/L2 mapping, XBSV v7 backups, and restore that picks the
+right path automatically:
 
-Why QEMU is excluded (project constraint since the early phases): forced Linux
-compatibility rules out shipping a Windows `qemu.exe`; stock `qemu-img convert`
-rebuilt images with wrong sizes; building xemu’s modified QEMU tools from
-source on Ubuntu did not produce usable qemu utilities. Writes go through the
-Python block device in `xemu_lab/qcow2.py` instead.
+- **same-guest** overwrite (+ allocate/envelopes on sparse/virgin);
+- **FATX remap** when backup clusters are already used by other titles.
 
-See `CHAPTER2_GUEST_AWARE_LAB.md` (overwrite era) and
-`CHAPTER3_QCOW2_ALLOCATE.md` (allocate 6.0). FATX cluster remapping is not in
-v1 (planned 6.1).
+**No qemu-img / QEMU.** Goldens under `D:\xemu\bk` are never opened for writing.
+
+See `CHAPTER2_GUEST_AWARE_LAB.md` (overwrite era), `CHAPTER3_QCOW2_ALLOCATE.md`
+(allocate 6.0), and `CHAPTER4_FATX_REMAP.md` (remap 6.1 — multi-game PASS).
 
 The old v5/v5.5 merger remains an empirical discovery oracle, but its restore
 path still treats host file offsets as guest offsets and must not be used on

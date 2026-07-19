@@ -592,6 +592,103 @@ class FATXVolume:
             )
         return bytes(data)
 
+    def is_cluster_free(self, cluster: int) -> bool:
+        if cluster < 1 or cluster > self.header.data_cluster_count:
+            return False
+        return self.read_fat_entry(cluster) == 0
+
+    def iter_free_clusters(
+        self,
+        *,
+        exclude: Optional[Set[int]] = None,
+    ) -> Iterator[int]:
+        """Yield cluster dati con FAT=0 (liberi)."""
+
+        blocked = exclude or set()
+        for cluster in range(1, self.header.data_cluster_count + 1):
+            if cluster in blocked:
+                continue
+            if self.read_fat_entry(cluster) == 0:
+                yield cluster
+
+    def find_free_clusters(
+        self,
+        count: int,
+        *,
+        exclude: Optional[Set[int]] = None,
+    ) -> List[int]:
+        """Trova ``count`` cluster liberi senza modificarli."""
+
+        if count <= 0:
+            raise ValueError("count deve essere > 0")
+        found: List[int] = []
+        for cluster in self.iter_free_clusters(exclude=exclude):
+            found.append(cluster)
+            if len(found) >= count:
+                return found
+        raise FATXBoundsError(
+            f"Cluster FATX liberi insufficienti: servono {count}, "
+            f"ne ho {len(found)}"
+        )
+
+    def fat_entry_offset(self, cluster: int) -> int:
+        if cluster < 0 or cluster >= self.header.max_clusters:
+            raise FATXBoundsError(f"Cluster FAT fuori range: {cluster}")
+        return self.header.fat_offset + cluster * self.header.fat_entry_size
+
+    def encode_fat_entry(self, value: int) -> bytes:
+        return int(value).to_bytes(self.header.fat_entry_size, "little")
+
+    def find_directory_slot(
+        self,
+        directory_first_cluster: int,
+    ) -> Tuple[int, int]:
+        """Trova uno slot dirent scrivibile (libero, deleted, o prima di END).
+
+        Restituisce ``(guest_offset, directory_cluster)``.
+        Non estende la directory: se è piena solleva ``FATXBoundsError``.
+        """
+
+        for directory_cluster in self.get_chain(directory_first_cluster):
+            cluster_data = self.read_cluster(directory_cluster)
+            cluster_guest_offset = self.cluster_offset(directory_cluster)
+            for entry_offset in range(0, len(cluster_data), FATX_DIRENT_SIZE):
+                marker = cluster_data[entry_offset]
+                guest_offset = cluster_guest_offset + entry_offset
+                if marker in (
+                    FATX_DIRENT_NEVER_USED,
+                    FATX_DIRENT_END,
+                    FATX_DIRENT_DELETED,
+                ):
+                    return guest_offset, directory_cluster
+        raise FATXBoundsError(
+            f"Nessuno slot libero nella directory "
+            f"(first_cluster={directory_first_cluster})"
+        )
+
+    def collect_title_clusters(self, title_id: str) -> Set[int]:
+        """Cluster dati usati da un Title ID in UDATA (e solo quelli)."""
+
+        normalized = title_id.strip().lower()
+        root = self.header.root_dir_first_cluster
+        area = self.find_child(root, "UDATA")
+        if area is None or not area.is_directory:
+            return set()
+        game = self.find_child(area.first_cluster, normalized)
+        if game is None:
+            game = self.find_child(area.first_cluster, title_id)
+        if game is None or not game.is_directory:
+            return set()
+
+        clusters: Set[int] = set(self.get_chain(game.first_cluster))
+        for item in self.walk(
+            first_cluster=game.first_cluster,
+            base_path=normalized,
+        ):
+            if item.entry.first_cluster > 0:
+                clusters.update(self.get_chain(item.entry.first_cluster))
+        return clusters
+
 
 def discover_fatx_volumes(
     device: BlockDevice,

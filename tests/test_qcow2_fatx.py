@@ -22,6 +22,10 @@ from xemu_lab.fatx import (
     FATXVolume,
     XboxRegion,
 )
+from xemu_lab.remap import (
+    build_remap_plan,
+    decide_restore_path,
+)
 from xemu_lab.qcow2 import (
     QCOW2BlockDevice,
     QCOW2FormatError,
@@ -44,7 +48,7 @@ HALO_H2 = Path(r"D:\xemu\bk\xbox_hddh2.qcow2")
 
 class MemoryBlockDevice:
     def __init__(self, data: bytes):
-        self.data = data
+        self.data = bytearray(data)
 
     @property
     def size(self) -> int:
@@ -53,7 +57,13 @@ class MemoryBlockDevice:
     def read_at(self, offset: int, size: int) -> bytes:
         if offset < 0 or size < 0 or offset + size > len(self.data):
             raise ValueError("lettura fuori range")
-        return self.data[offset : offset + size]
+        return bytes(self.data[offset : offset + size])
+
+    def write_at(self, offset: int, data: bytes, *, allocate: bool = False) -> None:
+        payload = bytes(data)
+        if offset < 0 or offset + len(payload) > len(self.data):
+            raise ValueError("scrittura fuori range")
+        self.data[offset : offset + len(payload)] = payload
 
 
 class QCOW2ReaderTests(unittest.TestCase):
@@ -516,6 +526,139 @@ class CatalogTests(unittest.TestCase):
             if filename in unknown:
                 self.assertEqual(unknown[filename].games, ())
                 self.assertIn("significato non dedotto", unknown[filename].description)
+
+
+class FatxAllocAndRemapTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.partition = XboxRegion("T", 0, 0x20000, "Fixture FATX")
+        self.device = MemoryBlockDevice(_make_synthetic_fatx())
+        self.volume = FATXVolume(self.device, self.partition)
+
+    def test_find_free_clusters_skips_used(self) -> None:
+        free = self.volume.find_free_clusters(2)
+        for cluster in free:
+            self.assertTrue(self.volume.is_cluster_free(cluster))
+        # 1-4 sono usati nella fixture.
+        self.assertTrue(min(free) >= 5)
+
+    def test_find_directory_slot_on_end_marker(self) -> None:
+        udata = self.volume.find_child(
+            self.volume.header.root_dir_first_cluster, "UDATA"
+        )
+        assert udata is not None
+        # UDATA ha solo 45410083 poi END.
+        offset, dir_cluster = self.volume.find_directory_slot(udata.first_cluster)
+        self.assertEqual(dir_cluster, udata.first_cluster)
+        self.assertEqual(self.device.read_at(offset, 1), b"\xff")
+
+    def test_decide_same_guest_when_clusters_free(self) -> None:
+        backup = _make_toy_backup(first_cluster=5)
+        decision = decide_restore_path(backup, self.volume)
+        self.assertTrue(decision.use_same_guest)
+
+    def test_decide_remap_when_clusters_occupied_by_other(self) -> None:
+        # Cluster 2/3/4 sono della fixture esistente (altro titolo).
+        backup = _make_toy_backup(first_cluster=2)
+        decision = decide_restore_path(backup, self.volume)
+        self.assertFalse(decision.use_same_guest)
+        self.assertTrue(decision.colliding_clusters)
+
+    def test_remap_installs_title_without_clobbering_existing(self) -> None:
+        backup = _make_toy_backup(first_cluster=2)
+        # Occupati: remap deve usare cluster >= 5.
+        plan = build_remap_plan(backup, self.volume)
+        self.assertEqual(plan.mode, "remap")
+        self.assertNotIn(2, plan.cluster_map.values())
+        for old, new in plan.cluster_map.items():
+            self.assertTrue(self.volume.is_cluster_free(new))
+
+        for guest_offset, payload in plan.pending:
+            self.device.write_at(guest_offset, payload)
+
+        # Ricarica volume sul device mutato.
+        volume = FATXVolume(self.device, self.partition)
+        games = {(g.area, g.title_id) for g in volume.list_games()}
+        self.assertIn(("UDATA", "45410083"), games)
+        self.assertIn(("UDATA", "4c410015"), games)
+
+        new_game = volume.find_child(
+            volume.find_child(
+                volume.header.root_dir_first_cluster, "UDATA"
+            ).first_cluster,
+            "4c410015",
+        )
+        assert new_game is not None
+        self.assertEqual(new_game.first_cluster, plan.game_first_cluster)
+        entries = [e.name for e in volume.iter_directory(new_game.first_cluster)]
+        self.assertEqual(entries, ["SaveMeta.xbx"])
+        meta = volume.find_child(new_game.first_cluster, "SaveMeta.xbx")
+        assert meta is not None
+        self.assertEqual(volume.read_file(meta), b"hello")
+
+        # Il titolo originale resta leggibile.
+        old = volume.find_child(
+            volume.find_child(
+                volume.header.root_dir_first_cluster, "UDATA"
+            ).first_cluster,
+            "45410083",
+        )
+        assert old is not None
+        save = volume.find_child(old.first_cluster, "SaveMeta.xbx")
+        assert save is not None
+        self.assertEqual(volume.read_file(save), b"test")
+
+
+def _make_toy_backup(*, first_cluster: int) -> GameBackup:
+    """Backup minimo: cartella Title + un file SaveMeta su due cluster."""
+
+    title = "4c410015"
+    dir_cluster = first_cluster
+    file_cluster = first_cluster + 1
+    cluster_size = 0x4000
+    file_area = 0x2000
+
+    # Dirent Title come se fosse in UDATA (fuori dai data chunk).
+    title_dirent = _make_dirent(title, 0x10, dir_cluster, 0)
+    title_udata_offset = 0x100  # fuori dai data cluster
+
+    save_dirent = _make_dirent("SaveMeta.xbx", 0x20, file_cluster, 5)
+    dir_payload = bytearray(cluster_size)
+    dir_payload[0:64] = save_dirent
+    dir_payload[64] = 0xFF
+
+    file_payload = bytearray(cluster_size)
+    file_payload[0:5] = b"hello"
+
+    fat_blob = (0xFFFF).to_bytes(2, "little") + (0xFFFF).to_bytes(2, "little")
+    fat_offset = 0x1000 + dir_cluster * 2
+
+    return GameBackup(
+        title_id=title,
+        partition="E",
+        source_path=Path("toy"),
+        source_sha256="",
+        created_at=datetime.now(timezone.utc),
+        fat_entry_size=2,
+        fatx_cluster_size=cluster_size,
+        directory_entries=[
+            (title_udata_offset, title_dirent),
+            (file_area + (dir_cluster - 1) * cluster_size, save_dirent),
+        ],
+        fat_runs=[(dir_cluster, fat_offset, fat_blob)],
+        data_chunks=[
+            (
+                dir_cluster,
+                file_area + (dir_cluster - 1) * cluster_size,
+                bytes(dir_payload),
+            ),
+            (
+                file_cluster,
+                file_area + (file_cluster - 1) * cluster_size,
+                bytes(file_payload),
+            ),
+        ],
+        format_version=7,
+    )
 
 
 def _make_synthetic_qcow2() -> bytes:

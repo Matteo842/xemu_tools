@@ -1,4 +1,4 @@
-"""Restore chirurgico guest-aware da backup XBSV v6/v7."""
+"""Restore chirurgico guest-aware da backup XBSV v6/v7 (+ remap FATX 6.1)."""
 
 from __future__ import annotations
 
@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from .backup import GameBackup, load_backup
-from .fatx import FATXVolume, get_region
+from .fatx import FATXError, FATXVolume, get_region
 from .qcow2 import (
     QCOW2WriteError,
     QCOW2WritableBlockDevice,
     UnsupportedQCOW2Feature,
 )
+from .remap import RemapError, build_remap_plan, decide_restore_path
 
 
 PathLike = Union[str, Path]
@@ -34,6 +35,8 @@ class RestoreReport:
     host_bytes_grown: int = 0
     allocate_used: bool = False
     envelopes_written: int = 0
+    mode: str = "same-guest"
+    clusters_remapped: int = 0
 
 
 def restore_backup_to_path(
@@ -41,12 +44,12 @@ def restore_backup_to_path(
     target_path: PathLike,
     verify: bool = True,
     allow_allocate: bool = False,
+    force_mode: Optional[str] = None,
 ) -> RestoreReport:
     """Applica il backup sull'immagine target.
 
-    Con ``allow_allocate=False`` (default) richiede cluster QCOW2 già
-    overwrite-safe. Con ``True`` alloca host cluster; per non corrompere
-    FAT/root condivisi serve un backup v7 con envelope QCOW2 interi.
+    Sceglie automaticamente same-guest vs remap FATX se la partizione
+    è un layout Xbox completo. ``force_mode``: ``same-guest`` | ``remap``.
     """
 
     target = Path(target_path)
@@ -60,8 +63,9 @@ def restore_backup_to_path(
                 device,
                 verify=verify,
                 allow_allocate=allow_allocate,
+                force_mode=force_mode,
             )
-    except (QCOW2WriteError, UnsupportedQCOW2Feature) as exc:
+    except (QCOW2WriteError, UnsupportedQCOW2Feature, RemapError, FATXError) as exc:
         raise RestoreError(str(exc)) from exc
     return report
 
@@ -72,6 +76,7 @@ def restore_backup_file(
     json_path: Optional[PathLike] = None,
     verify: bool = True,
     allow_allocate: bool = False,
+    force_mode: Optional[str] = None,
 ) -> RestoreReport:
     backup = load_backup(bin_path, json_path=json_path)
     return restore_backup_to_path(
@@ -79,6 +84,7 @@ def restore_backup_file(
         target_path,
         verify=verify,
         allow_allocate=allow_allocate,
+        force_mode=force_mode,
     )
 
 
@@ -87,26 +93,51 @@ def restore_backup_to_device(
     device: QCOW2WritableBlockDevice,
     verify: bool = True,
     allow_allocate: bool = False,
+    force_mode: Optional[str] = None,
 ) -> RestoreReport:
     if backup.fatx_cluster_size <= 0:
         raise RestoreError("fatx_cluster_size non valido nel backup")
 
-    pending: List[Tuple[int, bytes]] = []
-    for guest_offset, raw in backup.directory_entries:
-        pending.append((guest_offset, raw))
-    for _first, guest_offset, blob in backup.fat_runs:
-        pending.append((guest_offset, blob))
-    for _cluster, guest_offset, payload in backup.data_chunks:
-        pending.append((guest_offset, payload))
+    mode = "same-guest"
+    clusters_remapped = 0
+    pending: List[Tuple[int, bytes]]
+    use_envelopes = True
+
+    if force_mode == "remap" or (
+        force_mode is None and _can_consider_fatx_remap(device, backup)
+    ):
+        volume = FATXVolume.open_partition(device, backup.partition)
+        if force_mode == "remap":
+            decision_remap = True
+        elif force_mode == "same-guest":
+            decision_remap = False
+        else:
+            decision = decide_restore_path(backup, volume)
+            decision_remap = not decision.use_same_guest
+
+        if decision_remap:
+            plan = build_remap_plan(backup, volume)
+            pending = list(plan.pending)
+            mode = "remap"
+            clusters_remapped = len(plan.cluster_map)
+            use_envelopes = False  # offset guest diversi dagli envelope sorgente
+            # Remap scrive spesso su cluster QCOW2 nuovi → serve allocate+RMW.
+            allow_allocate = True
+        else:
+            pending = _surgical_pending(backup)
+            mode = "same-guest"
+    else:
+        pending = _surgical_pending(backup)
 
     allocated_before = device.clusters_allocated
     grown_before = device.host_bytes_grown
     envelopes_written = 0
 
     if allow_allocate:
-        _preflight_allocate(backup, device, pending)
+        if use_envelopes:
+            _preflight_allocate(backup, device, pending)
         with device.allocating():
-            if backup.has_qcow2_envelopes:
+            if use_envelopes and backup.has_qcow2_envelopes:
                 if (
                     backup.qcow2_cluster_size
                     and backup.qcow2_cluster_size != device.cluster_size
@@ -116,8 +147,6 @@ def restore_backup_to_device(
                         f"({backup.qcow2_cluster_size}) != target "
                         f"({device.cluster_size})"
                     )
-                # Envelope solo dove serve allocate. Dove il cluster è già
-                # overwrite-safe: nessun envelope → solo byte chirurgici (= v6).
                 for guest_cluster, payload in backup.qcow2_envelopes:
                     if not device.needs_allocation(guest_cluster):
                         continue
@@ -127,12 +156,11 @@ def restore_backup_to_device(
                         allocate=True,
                     )
                     envelopes_written += 1
+                for guest_offset, payload in pending:
+                    device.write_at(guest_offset, payload, allocate=True)
             else:
-                # Solo path compresso-safe senza envelope: RMW per cluster.
+                # Remap o v6: RMW per cluster QCOW2 intero.
                 _write_pending_allocating_coalesced(device, pending)
-
-            for guest_offset, payload in pending:
-                device.write_at(guest_offset, payload, allocate=True)
     else:
         for guest_offset, payload in pending:
             _ensure_range(
@@ -168,7 +196,33 @@ def restore_backup_to_device(
         host_bytes_grown=device.host_bytes_grown - grown_before,
         allocate_used=allow_allocate,
         envelopes_written=envelopes_written,
+        mode=mode,
+        clusters_remapped=clusters_remapped,
     )
+
+
+def _surgical_pending(backup: GameBackup) -> List[Tuple[int, bytes]]:
+    pending: List[Tuple[int, bytes]] = []
+    for guest_offset, raw in backup.directory_entries:
+        pending.append((guest_offset, raw))
+    for _first, guest_offset, blob in backup.fat_runs:
+        pending.append((guest_offset, blob))
+    for _cluster, guest_offset, payload in backup.data_chunks:
+        pending.append((guest_offset, payload))
+    return pending
+
+
+def _can_consider_fatx_remap(
+    device: QCOW2WritableBlockDevice,
+    backup: GameBackup,
+) -> bool:
+    """True se il target ha layout Xbox abbastanza grande per la partizione."""
+
+    try:
+        region = get_region(backup.partition)
+    except KeyError:
+        return False
+    return region.end <= device.size
 
 
 def _preflight_allocate(
@@ -188,7 +242,6 @@ def _preflight_allocate(
         if not device.needs_allocation(guest_cluster):
             continue
         if device.is_compressed_cluster(guest_cluster):
-            # Decompress + RMW preserva i byte non toccati.
             continue
         covered = coverage.get(guest_cluster, 0)
         if covered < device.cluster_size:
@@ -248,7 +301,6 @@ def _verify_title_visible(
     except KeyError:
         return
     if region.end > device.size:
-        # Fixture sintetiche più piccole del layout Xbox: skip.
         return
 
     try:
@@ -267,8 +319,7 @@ def _verify_title_visible(
     if not found:
         raise RestoreError(
             f"Title ID {backup.title_id} non visibile in FATX dopo restore "
-            "(probabile corruzione metadata QCOW2/FAT condivisi). "
-            "Su vergine usare backup XBSV v7 con envelope."
+            "(probabile corruzione metadata QCOW2/FAT condivisi o remap fallito)."
         )
 
 

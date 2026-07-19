@@ -341,13 +341,12 @@ class XemuTestLab:
                 print()
                 print(
                     f"ATTENZIONE: sul live non risulta {name} "
-                    f"({backup.title_id}). "
-                    "O non c’è, o è un HDD vergine/sparse / altro layout."
+                    f"({backup.title_id})."
                 )
                 print(
-                    "Il restore tenterà comunque (allocate automatico se serve). "
-                    "Su multi-game pieno i cluster FATX del backup possono "
-                    "collidere con altri Title ID (serve remap 6.1)."
+                    "Se i cluster FATX del backup sono liberi → restore "
+                    "same-guest; se sono occupati → remap automatico su "
+                    "cluster liberi (fase 6.1)."
                 )
                 proceed = input(
                     "Continuare lo stesso? (s/N): "
@@ -371,8 +370,6 @@ class XemuTestLab:
                     "Su vergine/sparse meglio rifare backup (v7)."
                 )
 
-            # Allocate sempre consentito: gli envelope si applicano solo
-            # ai cluster non overwrite-safe (parity v6 sugli altri).
             report = restore_backup_to_path(
                 backup,
                 active,
@@ -387,6 +384,8 @@ class XemuTestLab:
                     details=(
                         f"Target: {active}",
                         f"title_on_live={title_on_live}",
+                        f"mode={report.mode} "
+                        f"remapped={report.clusters_remapped}",
                         f"Dir={report.directory_entries} "
                         f"fat_bytes={report.fat_bytes} "
                         f"clusters={report.data_clusters}",

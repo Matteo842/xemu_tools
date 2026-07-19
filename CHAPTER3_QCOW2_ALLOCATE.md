@@ -9,7 +9,7 @@ Continua da [CHAPTER2_GUEST_AWARE_LAB.md](CHAPTER2_GUEST_AWARE_LAB.md).
 | Data | 18 luglio 2026 |
 | Scope v1 | Allocate QCOW2 agli **stessi** guest offset del backup |
 | Formato backup | **XBSV v7** (envelope cluster QCOW2 interi) + lettura v6 |
-| Fuori scope | Remap FATX → **6.1** |
+| Fuori scope all’epoca | Remap FATX → vedi [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) |
 | QEMU / qemu-img | Esclusi |
 | Entry | `START_XEMU_TEST.bat` → restore → conferma allocate |
 
@@ -54,11 +54,11 @@ save già validi (non è xemu che “inventa” il checkpoint: lo legge dal rest
 
 ---
 
-## 4. Cosa non fa (6.1)
+## 4. Fase successiva (6.1)
 
-Nessun remap FATX. Stress futuro: multi-game + Title ID assente sul target.
-Se i cluster FATX del backup sono liberi, same-guest può bastare; se sono
-occupati da altri giochi → collisione / corruzione → serve remap.
+Il remap FATX su multi-game è documentato in
+[CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) (collaudo HDD5 + Black v7 PASS
+in gioco su tutti i Title ID).
 
 ---
 
