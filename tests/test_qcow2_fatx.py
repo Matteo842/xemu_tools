@@ -36,8 +36,13 @@ from xemu_lab.qcow2 import (
     QCOW_OFLAG_COPIED,
     QCOW_OFLAG_ZERO,
 )
-from xemu_lab.restore import restore_backup_to_path
-from xemu_lab.safety import SafetyError, assert_not_golden, atomic_copy_qcow2
+from xemu_lab.restore import RestoreError, restore_backup_to_path
+from xemu_lab.safety import (
+    SafetyError,
+    assert_not_golden,
+    assert_path_writable,
+    atomic_copy_qcow2,
+)
 
 
 BLACK_B1 = Path(r"D:\xemu\bk\xbox_hddB1.qcow2")
@@ -407,6 +412,65 @@ class SafetyTests(unittest.TestCase):
             report = atomic_copy_qcow2(source, dest, folder)
         self.assertTrue(dest.is_file())
         self.assertEqual(report.sha256, hashlib.sha256(source.read_bytes()).hexdigest())
+
+    def test_assert_path_writable_ok(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "live.qcow2"
+        path.write_bytes(_make_synthetic_qcow2())
+        assert_path_writable(path)
+
+    def test_restore_rolls_back_on_unsafe_allocate(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "live.qcow2"
+        path.write_bytes(_make_synthetic_qcow2())
+        with QCOW2BlockDevice(path) as device:
+            before = device.read_at(0, 64)
+
+        bad = GameBackup(
+            title_id="4c410015",
+            partition="E",
+            source_path=path,
+            source_sha256="",
+            created_at=datetime.now(timezone.utc),
+            fat_entry_size=2,
+            fatx_cluster_size=0x4000,
+            directory_entries=[(0x1000, b"D" * 64)],
+            fat_runs=[],
+            data_chunks=[],
+            format_version=6,
+        )
+        with self.assertRaises(RestoreError) as ctx:
+            restore_backup_to_path(
+                bad,
+                path,
+                verify=False,
+                allow_allocate=True,
+            )
+        self.assertIn("envelope", str(ctx.exception).lower())
+        with QCOW2WritableBlockDevice(path) as device:
+            self.assertFalse(device.header.is_dirty)
+            self.assertEqual(device.read_at(0, 64), before)
+            # Immagine ancora apribile in scrittura dopo undo.
+            device.write_at(0, before[:16])
+
+    def test_host_checkpoint_undoes_allocate(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / "live.qcow2"
+        path.write_bytes(_make_synthetic_qcow2())
+        host_before = path.stat().st_size
+
+        with QCOW2WritableBlockDevice(path) as device:
+            checkpoint = device.capture_host_checkpoint()
+            device.write_at(0x1000, b"NEWDATA!!", allocate=True)
+            self.assertGreater(device.host_bytes_grown, 0)
+            device.restore_host_checkpoint(checkpoint)
+            self.assertFalse(device.header.is_dirty)
+            self.assertEqual(device.read_at(0x1000, 8), bytes(8))
+
+        self.assertEqual(path.stat().st_size, host_before)
 
 
 class FATXParserTests(unittest.TestCase):

@@ -20,6 +20,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Set,
     Tuple,
     Union,
 )
@@ -115,6 +116,26 @@ class ClusterMapping:
     host_offset: Optional[int]
     allocated: bool
     reads_as_zero: bool
+
+
+@dataclass(frozen=True)
+class HostCheckpoint:
+    """Snapshot metadati QCOW2 + size host per rollback allocate.
+
+    Non clona i dati guest: solo header refcount/L1/L2/refcount blocks
+    già presenti e la dimensione del file. I nuovi cluster sono in coda
+    e spariscono col truncate.
+    """
+
+    host_size: int
+    incompatible_features: int
+    l1_table_offset: int
+    l1_raw: bytes
+    l2_blobs: Tuple[Tuple[int, bytes], ...]
+    refcount_table_offset: int
+    refcount_table_clusters: int
+    refcount_table_raw: bytes
+    refcount_block_blobs: Tuple[Tuple[int, bytes], ...]
 
 
 class QCOW2BlockDevice:
@@ -765,18 +786,129 @@ class QCOW2WritableBlockDevice(QCOW2BlockDevice):
 
     @contextmanager
     def allocating(self) -> Iterator["QCOW2WritableBlockDevice"]:
-        """Sessione di mutazione metadati (dirty bit + flush finale)."""
+        """Sessione di mutazione metadati (dirty bit + flush finale).
+
+        Se la sessione fallisce a metà, il dirty bit resta alzato: l'immagine
+        non è più considerata scrivibile finché non si fa rollback esplicito
+        (``restore_host_checkpoint``) o ripristino esterno.
+        """
 
         nested = self._metadata_dirty
         if not nested:
             self._begin_metadata_mutation()
+        succeeded = False
         try:
             yield self
             if not nested:
                 self.flush()
-        finally:
-            if not nested:
                 self._end_metadata_mutation()
+            succeeded = True
+        finally:
+            if not nested and not succeeded:
+                try:
+                    self.flush()
+                except Exception:
+                    pass
+
+    def capture_host_checkpoint(self) -> HostCheckpoint:
+        """Cattura metadati host per undo allocate (file tipicamente piccoli)."""
+
+        self._require_writable()
+        header = self.header
+        l1_raw = self._read_exact_host(
+            header.l1_table_offset,
+            header.l1_size * 8,
+        )
+        l2_blobs: List[Tuple[int, bytes]] = []
+        for entry in self._l1_table:
+            if entry == 0:
+                continue
+            l2_offset = entry & QCOW_OFFSET_MASK
+            if l2_offset == 0:
+                continue
+            l2_blobs.append(
+                (l2_offset, self._read_exact_host(l2_offset, self.cluster_size))
+            )
+
+        refcount_bytes = header.refcount_table_clusters * self.cluster_size
+        refcount_raw = self._read_exact_host(
+            header.refcount_table_offset,
+            refcount_bytes,
+        )
+        block_blobs: List[Tuple[int, bytes]] = []
+        seen_blocks: Set[int] = set()
+        entry_count = refcount_bytes // 8
+        for index in range(entry_count):
+            block_offset = struct.unpack_from(">Q", refcount_raw, index * 8)[0]
+            block_offset &= QCOW_OFFSET_MASK
+            if block_offset == 0 or block_offset in seen_blocks:
+                continue
+            if block_offset + self.cluster_size > self._host_size:
+                continue
+            seen_blocks.add(block_offset)
+            block_blobs.append(
+                (
+                    block_offset,
+                    self._read_exact_host(block_offset, self.cluster_size),
+                )
+            )
+
+        return HostCheckpoint(
+            host_size=self._host_size,
+            incompatible_features=header.incompatible_features,
+            l1_table_offset=header.l1_table_offset,
+            l1_raw=l1_raw,
+            l2_blobs=tuple(l2_blobs),
+            refcount_table_offset=header.refcount_table_offset,
+            refcount_table_clusters=header.refcount_table_clusters,
+            refcount_table_raw=refcount_raw,
+            refcount_block_blobs=tuple(block_blobs),
+        )
+
+    def restore_host_checkpoint(self, checkpoint: HostCheckpoint) -> None:
+        """Ripristina metadati + truncate host (undo allocate fallito)."""
+
+        self._require_writable()
+        assert self._file is not None
+        self._file.flush()
+        self._file.truncate(checkpoint.host_size)
+        self._host_size = checkpoint.host_size
+
+        # Header refcount (offset 48 = u64, 56 = u32).
+        self._write_exact_host(
+            48,
+            struct.pack(">Q", checkpoint.refcount_table_offset),
+        )
+        self._write_exact_host(
+            56,
+            struct.pack(">I", checkpoint.refcount_table_clusters),
+        )
+        self._write_exact_host(
+            checkpoint.refcount_table_offset,
+            checkpoint.refcount_table_raw,
+        )
+        for offset, blob in checkpoint.refcount_block_blobs:
+            self._write_exact_host(offset, blob)
+
+        self._write_exact_host(checkpoint.l1_table_offset, checkpoint.l1_raw)
+        for offset, blob in checkpoint.l2_blobs:
+            self._write_exact_host(offset, blob)
+
+        # Ricarica stato in memoria e togli dirty.
+        self._header = self._read_header()
+        self._l1_table = self._read_l1_table()
+        self._l2_cache.clear()
+        self._refcount_table = list(self._read_refcount_table())
+        self._metadata_dirty = False
+        self._set_dirty_bit(
+            bool(checkpoint.incompatible_features & QCOW2_INCOMPAT_DIRTY)
+        )
+        # Se il checkpoint era pulito, assicurati dirty=0.
+        if not (checkpoint.incompatible_features & QCOW2_INCOMPAT_DIRTY):
+            self._set_dirty_bit(False)
+        self.flush()
+        self._clusters_allocated = 0
+        self._host_bytes_grown = 0
 
     def _write_payload_chunks(self, offset: int, payload: bytes) -> None:
         cursor = 0

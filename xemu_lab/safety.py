@@ -105,6 +105,21 @@ def find_xemu_processes() -> list[str]:
     return matches
 
 
+def assert_path_writable(path: PathLike) -> None:
+    """Verifica che il file target esista e non sia di sola lettura."""
+
+    target = Path(path)
+    if not target.is_file():
+        raise SafetyError(f"HDD assente: {target}")
+    if not os.access(target, os.W_OK):
+        raise SafetyError(f"HDD non scrivibile (sola lettura?): {target}")
+    if os.name == "nt":
+        import stat as stat_mod
+
+        if not (target.stat().st_mode & stat_mod.S_IWRITE):
+            raise SafetyError(f"HDD non scrivibile (sola lettura?): {target}")
+
+
 def assert_xemu_closed() -> None:
     running = find_xemu_processes()
     if running:

@@ -37,7 +37,7 @@ from xemu_lab.qcow2 import (
     QCOW2Error,
     UnsupportedQCOW2Feature,
 )
-from xemu_lab.restore import RestoreError, restore_backup_to_path
+from xemu_lab.restore import RestoreError, safe_restore_backup_to_path
 from xemu_lab.safety import (
     SafetyError,
     assert_not_golden,
@@ -164,7 +164,12 @@ class XemuTestLab:
 
             print(f"\n[4/5] Restore {title_id} sull'HDD attivo...")
             assert_not_golden(active, self.catalog.config.backup_folder)
-            report = restore_backup_to_path(backup, active, verify=True)
+            report = safe_restore_backup_to_path(
+                backup,
+                active,
+                verify=True,
+                allow_allocate=True,
+            )
             print(
                 f"  OK: dir={report.directory_entries}, "
                 f"fat_bytes={report.fat_bytes}, "
@@ -370,7 +375,7 @@ class XemuTestLab:
                     "Su vergine/sparse meglio rifare backup (v7)."
                 )
 
-            report = restore_backup_to_path(
+            report = safe_restore_backup_to_path(
                 backup,
                 active,
                 verify=True,
