@@ -1,124 +1,154 @@
-# Capitolo 2 — Laboratorio guest-aware QCOW2/FATX (QEMU-free)
+# Chapter 2 — Guest-aware QCOW2/FATX lab (QEMU-free)
 
-**Questo file non è un `AI_REFERENCE_SESSION*`. Non mescolarlo con le sessioni v5.**
+This document describes the first production-grade write path for this project:
+real QCOW2 L1/L2 mapping, XBSV v6/v7 backups, and overwrite-only restore in
+pure Python — **without QEMU**.
 
-Quei documenti descrivono l’era `single_game_merger.py` (seek host ≈ guest).  
-Questo documento apre il capitolo successivo: mapping L1/L2 reale, backup XBSV v6, restore overwrite-only in Python, **senza QEMU**.
+It is **not** part of the older `AI_REFERENCE_SESSION*` notes. Those cover the
+legacy `single_game_merger.py` era, where host file seeks were often treated as
+guest offsets. Do not mix the two eras.
 
-| Campo | Valore |
+| Field | Value |
 |--------|--------|
-| Data resoconto | 18 luglio 2026 |
-| Entry point | `START_XEMU_TEST.bat` → `xemu_test_lab.py` |
-| Codice nuovo | `xemu_lab/` |
-| Oracle legacy (non usare in write) | `single_game_merger.py` |
-| QEMU / qemu-img | Esclusi di proposito |
+| Report date | 18 July 2026 |
+| Lab entry point | `START_XEMU_TEST.bat` → `xemu_test_lab.py` |
+| Current code | `xemu_lab/` |
+| Legacy oracle (do **not** use for writes) | `single_game_merger.py` |
+| QEMU / qemu-img | Intentionally excluded |
+
+> **Note for readers:** Paths such as `D:\xemu\bk` and `D:\xemu\xbox_hdd.qcow2`
+> refer to the author’s local lab layout. This repository is a research lab, not
+> a drop-in installer. End-user workflows live in
+> [SaveState](https://github.com/Matteo842/SaveState).
 
 ---
 
-## 1. Perché un capitolo nuovo
+## 1. Why a new chapter
 
-Per mesi il restore “funzionava” spesso perché gli offset guest venivano usati come offset del file `.qcow2`. Su layout fortunati combaciava; non era un block device corretto.
+For months, restores often “worked” because guest offsets were written as if
+they were offsets inside the `.qcow2` file. On lucky layouts that coincided with
+reality. It was not a correct block device.
 
-Vincoli di progetto (da non dimenticare):
+Project constraints that shaped this chapter:
 
-- Compatibilità Linux → niente dipendenza da `qemu.exe` Windows.
-- `qemu-img convert` aveva ricostruito HDD con dimensioni sbagliate.
-- Build dei tool QEMU modificati di xemu da sorgente (Ubuntu) fallita / incompleta.
-- Scrittura ammessa solo in Python sul mapping guest→host già validato.
-
----
-
-## 2. Cosa è stato costruito
-
-### Lettura (gate read-only)
-
-- `xemu_lab/qcow2.py` — `QCOW2BlockDevice` read-only, L1/L2, zero/unallocated, rifiuto backing/cifratura/feature incompatibili.
-- `xemu_lab/fatx.py` — partizioni Xbox fisse, FATX, catene, `E:\UDATA` / `E:\TDATA`.
-- `xemu_lab/compare.py` — diff guest-aware per regione/cluster.
-- `xemu_lab/catalog.py` — registro `hdd_backups.json`, file non catalogati senza significato inventato.
-
-### Scrittura (fase successiva al gate)
-
-- `QCOW2WritableBlockDevice.write_at` — **solo overwrite** di cluster QCOW2 già allocati, non zero, non compressi. Niente allocate-on-write, niente update L2/refcount.
-- `xemu_lab/backup.py` — formato **XBSV v6/v7** (offset solo guest; v7 + envelope cluster QCOW2) + JSON; nomi file leggibili.
-- `xemu_lab/restore.py` — apply dir → FAT → data (v7: envelope se allocate), fsync, read-back + check Title ID FATX.
-- `xemu_lab/safety.py` — xemu chiuso, divieto scrittura in `D:\xemu\bk`, copia atomica + hash, rollback = ricopia golden.
-- `xemu_lab/titles.py` — mappa nomi da `GAME_NAMES` del merger + scan UDATA guest-aware.
-
-`single_game_merger.py` **non è stato modificato** e **non è il motore di write**.
+- Linux compatibility — no dependency on Windows `qemu.exe`
+- `qemu-img convert` had previously rebuilt HDDs with wrong sizes
+- Building xemu’s modified QEMU tooling from source (Ubuntu) failed / was incomplete
+- Writes were allowed only in Python, on a guest→host mapping already validated read-only
 
 ---
 
-## 3. Gate forensi (prima delle scritture)
+## 2. What was built
 
-| Check | Esito | Note |
+### Read path (read-only gate)
+
+- `xemu_lab/qcow2.py` — `QCOW2BlockDevice` (read-only): L1/L2, zero/unallocated,
+  rejects backing files, encryption, and incompatible features
+- `xemu_lab/fatx.py` — fixed Xbox partitions, FATX chains, `E:\UDATA` / `E:\TDATA`
+- `xemu_lab/compare.py` — guest-aware diff by region/cluster
+- `xemu_lab/catalog.py` — registry via `hdd_backups.json`; uncatalogued files are
+  not given invented meanings
+
+### Write path (after the gate)
+
+- `QCOW2WritableBlockDevice.write_at` — **overwrite only** of QCOW2 clusters that
+  are already allocated, non-zero, and uncompressed. No allocate-on-write, no
+  L2/refcount updates in this chapter’s initial write mode
+- `xemu_lab/backup.py` — **XBSV v6/v7** (guest offsets only; v7 adds full QCOW2
+  cluster envelopes) + JSON sidecars; human-readable filenames
+- `xemu_lab/restore.py` — apply directory → FAT → data (v7: envelopes when
+  allocate is enabled), fsync, read-back + FATX Title ID check
+- `xemu_lab/safety.py` — require xemu closed; forbid writes under the golden
+  backup tree; atomic copy + hash; rollback = recopy golden
+- `xemu_lab/titles.py` — display names from the merger `GAME_NAMES` map +
+  guest-aware UDATA scan
+
+`single_game_merger.py` was **not** modified and is **not** the write engine.
+
+---
+
+## 3. Forensic gate (before any writes)
+
+| Check | Result | Notes |
 |--------|--------|------|
-| B1/B2 mapping + delta 64 byte | PASS | CONFIG 1; E cluster 5/9/11 → 2/2/59 |
-| H1/H2 delta guest-aware | PASS | Totale 428 287 103; Y 427 278 322; E 1 008 759; altro 22 |
-| B1/B2 in gioco | OK | Non corrotti; restano fixture, non golden di restore “fidati” in assoluto |
+| B1/B2 mapping + 64-byte delta | PASS | CONFIG: 1 byte; E clusters 5/9/11 → 2/2/59 differing bytes |
+| H1/H2 guest-aware delta | PASS | Total 428,287,103; Y 427,278,322; E 1,008,759; other 22 |
+| B1/B2 in-game | OK | Not corrupted; they remain forensic fixtures, not absolute restore goldens |
 
 ---
 
-## 4. Collaudi restore in xemu (18 luglio 2026)
+## 4. Restore validation in xemu (18 July 2026)
 
-Convenzione: backup da golden in `D:\xemu\bk` (sempre `rb`); restore solo su `D:\xemu\xbox_hdd.qcow2` (live).
+Convention used in the lab: backups are taken from goldens under `D:\xemu\bk`
+(always opened read-only). Restores write only to the active
+`D:\xemu\xbox_hdd.qcow2` (live).
 
-### Prove base / chirurgia
+### Baseline / surgical tests
 
-| # | Test | Esito |
+| # | Test | Result |
 |---|------|--------|
-| 1 | Ciclo HDD1 Mercenaries (copia + delete + restore) | PASS in gioco |
-| 2 | Backup/restore ToeJam da HDD2 | PASS |
-| 3 | Delete Mercenaries, restore solo ToeJam | PASS — Mercenaries resta assente (non è dump 1:1 HDD) |
-| 4 | Backup Mercenaries da HDD1 → restore su live basato su HDD5 (Merc cancellato, altri giochi presenti) | PASS — Merc ok; Halo / ToeJam / NFS intatti |
-| 5 | Backup Halo H1 → restore su live H2 | PASS — stesso checkpoint di H1 |
+| 1 | HDD1 Mercenaries cycle (copy + delete + restore) | PASS in-game |
+| 2 | Backup/restore ToeJam from HDD2 | PASS |
+| 3 | Delete Mercenaries, restore ToeJam only | PASS — Mercenaries stays absent (not a 1:1 HDD dump) |
+| 4 | Mercenaries from HDD1 → live based on HDD5 (Merc deleted, other games present) | PASS — Merc OK; Halo / ToeJam / NFS intact |
+| 5 | Halo H1 backup → live H2 | PASS — same checkpoint as H1 |
 | 6 | Black B1 → live B2 | PASS — 1% |
 | 7 | Black B2 → live B1 | PASS — 3% |
 
-### Limite colpito, poi superato (allocate / cap. 3)
+### Limit hit, then cleared (allocate / Chapter 3)
 
-| # | Test | Esito | Dettaglio |
-|---|------|--------|-----------|
-| 8a | Restore Black su HDD vergine, overwrite-only | **FAIL controllato** | cluster QCOW2 compresso/unalloc |
-| 8b | Stesso scenario, backup **XBSV v7** + allocate | **PASS in gioco** (18/07/2026) | `Black (18-07-26 11-30) v7`; envelopes=4; save 1% leggibile |
+| # | Test | Result | Detail |
+|---|------|--------|--------|
+| 8a | Restore Black onto virgin HDD, overwrite-only | **Controlled FAIL** | compressed / unallocated QCOW2 clusters |
+| 8b | Same scenario, **XBSV v7** + allocate | **PASS in-game** (18 Jul 2026) | `Black (18-07-26 11-30) v7`; envelopes=4; 1% save readable |
 
-Dettaglio size (osservazione utente, collaudo 8b): subito dopo il lab il live era ~1800 KB (meno di B1=2048 KB); dopo aver avviato xemu e verificato il save, il file live è tornato **2048 KB**. Il lab aveva allocato i 4 envelope necessari al save; xemu, leggendo/scrivendo il disco, ha portato il contenitore host alla stessa footprint di B1. I save erano già corretti prima di quella crescita.
+File-size observation (test 8b): right after the lab restore, the live file was
+~1800 KB (smaller than B1 at 2048 KB). After booting xemu and checking the save,
+the live file grew back to **2048 KB**. The lab had allocated the four envelopes
+needed for the save; xemu, by reading/writing the disk, materialised the rest of
+the host footprint that B1 already had. The saves were already correct **before**
+that growth.
 
-Resoconto tecnico allocate / v7: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md).
-
----
-
-## 5. Cosa dimostra / cosa non dimostra
-
-**Dimostra**
-
-- Il restore non è una copia cieca golden→live: altri Title ID restano quelli del live.
-- Cross-golden funziona quando i cluster QCOW2 necessari sono già allocati (e non compressi) sul target.
-- Halo (centinaia di cluster) e Black checkpoint passano sullo stesso motore di Mercenaries/ToeJam.
-- Con XBSV v7 + allocate: restore Black su HDD vergine/sparse **funziona in gioco** (non solo read-back lab).
-
-**Non dimostra** (all’epoca del cap. 2)
-
-- Remap FATX su cluster già usati da altri Title ID → risolto in
-  [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md).
-- Che `verified=True` da solo basti senza conferma in xemu.
+Allocate / v7 technical report: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md).
 
 ---
 
-## 6. Prossimi stress / fasi successive
+## 5. What this proves / what it does not
 
-- Allocate QCOW2: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md)
-- Remap FATX 6.1: [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) (PASS umano 19/07/2026)
+**Proves**
+
+- Restore is not a blind golden→live copy: other Title IDs on the live disk stay
+  as they were
+- Cross-golden restore works when the needed QCOW2 clusters are already allocated
+  (and uncompressed) on the target
+- Halo (hundreds of clusters) and Black checkpoints share the same engine as
+  Mercenaries / ToeJam
+- With XBSV v7 + allocate: Black restore onto a virgin/sparse HDD **works in-game**
+  (not only lab read-back)
+
+**Does not prove** (as of this chapter’s original scope)
+
+- FATX remap onto clusters already used by other Title IDs — resolved in
+  [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md)
+- That `verified=True` alone is enough without an in-xemu check
 
 ---
 
-## 7. File e cartelle di questo capitolo
+## 6. Follow-on phases
+
+- QCOW2 allocate: [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md)
+- FATX remap 6.1: [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md)
+  (human PASS 19 Jul 2026)
+
+---
+
+## 7. Files for this chapter
 
 ```
 xemu_test_lab.py
 START_XEMU_TEST.bat
 xemu_lab/
-  qcow2.py      # read + writable + allocate opt-in
+  qcow2.py      # read + writable + opt-in allocate
   fatx.py
   compare.py
   catalog.py
@@ -127,20 +157,22 @@ xemu_lab/
   safety.py
   titles.py
 tests/test_qcow2_fatx.py
-surgical_backups_v6/   # output backup (gitignore)
-CHAPTER2_GUEST_AWARE_LAB.md   # questo resoconto
-CHAPTER3_QCOW2_ALLOCATE.md    # fase 6.0 allocate-on-write
-CHAPTER4_FATX_REMAP.md        # fase 6.1 remap FATX
+surgical_backups_v6/   # backup output (gitignored)
+CHAPTER2_GUEST_AWARE_LAB.md   # this report
+CHAPTER3_QCOW2_ALLOCATE.md    # phase 6.0 allocate-on-write
+CHAPTER4_FATX_REMAP.md        # phase 6.1 FATX remap
 ```
 
-Non usare come specifica operativa: `AI_REFERENCE_SESSION1.md` … `SESSION8.md` (era v5 / offset fisici).
+Do not treat `AI_REFERENCE_SESSION1.md` … `SESSION8.md` (archived) as the
+operational spec for the current engine — those describe the v5 / physical-offset era.
 
 ---
 
-## 8. Regole operative rimaste valide
+## 8. Lab operating rules (still valid)
 
-1. Golden in `D:\xemu\bk` → solo lettura.
-2. Write solo sull’HDD attivo configurato.
-3. xemu chiuso prima di copia/restore.
-4. B1/B2 = fixture forensi utili; primo collaudo “prodotto” era HDD1, poi stress multi-game / Halo / Black.
-5. Nessun qemu-img nel percorso supportato.
+1. Goldens under the lab backup tree → read-only
+2. Writes only on the configured active HDD
+3. Close xemu before copy/restore
+4. B1/B2 are useful forensic fixtures; the first “product-like” write target was
+   HDD1, then multi-game / Halo / Black stress
+5. No `qemu-img` in the supported path

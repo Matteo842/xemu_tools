@@ -1,78 +1,93 @@
-# Capitolo 3 — Allocate-on-write QCOW2 (fase 6.0)
+# Chapter 3 — QCOW2 allocate-on-write (phase 6.0)
 
-**Questo file non è un `AI_REFERENCE_SESSION*`. Non mescolarlo con le sessioni v5.**
+Continues from [CHAPTER2_GUEST_AWARE_LAB.md](CHAPTER2_GUEST_AWARE_LAB.md).
 
-Continua da [CHAPTER2_GUEST_AWARE_LAB.md](CHAPTER2_GUEST_AWARE_LAB.md).
+This chapter covers restoring a surgical save onto **virgin or sparse** QCOW2
+disks — including cases where the game was never launched on the target HDD.
 
-| Campo | Valore |
+It is **not** part of the older `AI_REFERENCE_SESSION*` notes (legacy v5 /
+physical-offset era).
+
+| Field | Value |
 |--------|--------|
-| Data | 18 luglio 2026 |
-| Scope v1 | Allocate QCOW2 agli **stessi** guest offset del backup |
-| Formato backup | **XBSV v7** (envelope cluster QCOW2 interi) + lettura v6 |
-| Fuori scope all’epoca | Remap FATX → vedi [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) |
-| QEMU / qemu-img | Esclusi |
-| Entry | `START_XEMU_TEST.bat` → restore → conferma allocate |
+| Date | 18 July 2026 |
+| v1 scope | Allocate QCOW2 clusters at the **same** guest offsets as the backup |
+| Backup format | **XBSV v7** (full QCOW2 cluster envelopes) + still readable as v6 |
+| Out of scope at the time | FATX remap → see [CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) |
+| QEMU / qemu-img | Excluded |
+| Lab entry | `START_XEMU_TEST.bat` → restore → confirm allocate |
+
+> Paths such as `D:\xemu\…` are lab-specific. For end-user use, see
+> [SaveState](https://github.com/Matteo842/SaveState).
 
 ---
 
-## 1. Problema iniziale
+## 1. The problem
 
-Overwrite-only falliva su cluster compressi/unalloc. Il primo allocate (solo
-byte chirurgici XBSV v6 su cluster QCOW2 da 64 KiB azzerati) poteva distruggere
-FAT/root/UDATA nello stesso cluster guest → lab `verified=True` ma save assenti
-in gioco.
+Overwrite-only restore fails when the needed QCOW2 clusters are compressed or
+unallocated.
 
----
-
-## 2. Fix (v7 + envelope)
-
-Un solo metodo di backup (v7). Gli envelope sono **dati in più** usati dal
-restore solo dove serve.
-
-1. Backup XBSV **v7**: segmenti chirurgici (= v6) + envelope cluster QCOW2.
-2. Restore **senza** allocate: solo segmenti chirurgici → **parity v6**.
-3. Restore **con** allocate: envelope **solo** sui cluster che non sono
-   overwrite-safe; sugli altri di nuovo solo chirurgia (= v6). Poi verify FATX.
-4. Backup v6 senza envelope: allocate su unalloc/zero a copertura parziale → rifiuto.
+An early allocate attempt (writing only the surgical XBSV v6 bytes into freshly
+zeroed 64 KiB QCOW2 clusters) could destroy FAT / root / UDATA that shared the
+same guest cluster. The lab reported `verified=True`, but saves were missing
+in-game.
 
 ---
 
-## 3. Collaudo umano PASS (18 luglio 2026)
+## 2. The fix (v7 + envelopes)
 
-| Step | Esito |
+There is a single backup method: **v7**. Envelopes are **extra data** consumed
+by restore only where allocate is required.
+
+1. **XBSV v7 backup:** surgical segments (same as v6) **plus** full QCOW2 cluster
+   envelopes
+2. **Restore without allocate:** surgical segments only → **v6 parity**
+3. **Restore with allocate:** envelopes **only** on clusters that are not
+   overwrite-safe; elsewhere surgical writes only (= v6). Then FATX verify
+4. **v6 backup without envelopes:** allocate onto unalloc/zero with only partial
+   cluster coverage → **rejected**
+
+---
+
+## 3. Human PASS (18 July 2026)
+
+| Step | Result |
 |------|--------|
-| Restore `Black (18-07-26 11-30) v7` su live vergine, allocate=sì | Lab PASS: verified, envelopes=4, qcow2_new=4, host_grown=262144 |
-| Size file subito dopo lab | ~1800 KB (< B1 2048 KB) |
-| Boot xemu + save 1% | **OK in gioco** |
-| Size file dopo xemu | **2048 KB** (= B1) |
+| Restore `Black (18-07-26 11-30) v7` onto virgin live, allocate=yes | Lab PASS: verified, envelopes=4, qcow2_new=4, host_grown=262144 |
+| File size right after lab | ~1800 KB (< B1 at 2048 KB) |
+| Boot xemu + 1% save | **OK in-game** |
+| File size after xemu | **2048 KB** (= B1) |
 
-Interpretazione size: B1 = vergine + primo CP Black, footprint host 2048 KB.
-Il lab alloca in modo mirato i 4 envelope del save; altri cluster host che B1
-aveva già “toccato” possono restare non materializzati finché xemu non li legge
-o scrive. Al boot xemu completa l’allocazione host → stessa size di B1, con i
-save già validi (non è xemu che “inventa” il checkpoint: lo legge dal restore).
-
----
-
-## 4. Fase successiva (6.1)
-
-Il remap FATX su multi-game è documentato in
-[CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) (collaudo HDD5 + Black v7 PASS
-in gioco su tutti i Title ID).
+**How to read the size change:** B1 is “virgin + first Black checkpoint”, host
+footprint 2048 KB. The lab allocates only the four envelopes needed for the
+save. Other host clusters that B1 had already touched can remain unmaterialised
+until xemu reads or writes them. On boot, xemu completes host allocation → same
+size as B1, while the saves were already valid (xemu is **not** inventing the
+checkpoint; it is reading it from the restore).
 
 ---
 
-## 5. Sicurezza
+## 4. Next phase (6.1)
 
-- Golden in `D:\xemu\bk` → mai in scrittura
-- Allocate non è rollback atomico → sempre su copia/live
-- Crash a metà → dirty bit; ripristinare da golden
+FATX remap on multi-game disks is documented in
+[CHAPTER4_FATX_REMAP.md](CHAPTER4_FATX_REMAP.md) (HDD5 + Black v7 PASS in-game
+for every Title ID checked).
 
 ---
 
-## 6. Test automatici
+## 5. Safety
 
-- Allocate unalloc / zero / compresso / L2 mancante
-- v6 allocate parziale su unalloc → reject
-- v7 serialize + restore con envelope
-- Forensi B1/B2 invariati
+- Goldens under the lab backup tree → never opened for write
+- Allocate is not crash-atomic mid-write → always run on a copy / live disk
+- Crash halfway → treat the image as dirty; restore from golden
+
+---
+
+## 6. Automated tests
+
+Covered in the suite (among others):
+
+- Allocate for unallocated / zero / compressed / missing L2
+- v6 partial allocate onto unalloc → reject
+- v7 serialize + restore with envelopes
+- Forensic B1/B2 fixtures remain unchanged by the gate

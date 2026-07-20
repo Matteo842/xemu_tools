@@ -47,7 +47,7 @@ Human-verified in xemu, not only `verified=True` in Python:
 | **Black on a virgin/sparse HDD** via XBSV v7 + QCOW2 allocate | PASS in-game |
 | **Black remapped onto a populated multi-game HDD** (Mercenaries, ToeJam, Halo 2, NFS present; Black never launched there) | PASS — Black save OK; other titles intact |
 
-Technical write-ups (Italian lab notes):
+Technical write-ups:
 
 - [CHAPTER2_GUEST_AWARE_LAB.md](CHAPTER2_GUEST_AWARE_LAB.md) — guest-aware QCOW2/FATX lab, overwrite-only era  
 - [CHAPTER3_QCOW2_ALLOCATE.md](CHAPTER3_QCOW2_ALLOCATE.md) — allocate-on-write + XBSV v7 envelopes  
