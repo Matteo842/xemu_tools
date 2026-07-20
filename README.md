@@ -13,9 +13,19 @@ End users should not start here. The production implementation lives in **[SaveS
 | Audience | Where to go |
 |----------|-------------|
 | **Players / save managers** | **[SaveState](https://github.com/Matteo842/SaveState)** — UI, workflows, and the integrated surgical engine |
-| **Researchers / journalists / developers** | This repository — method, lab notes, and the QEMU-free stack under `xemu_lab/` |
+| **Try the engine without SaveState** | `xemu_saves.py` in this repo — small colored CLI (backup / restore / list games) |
+| **Researchers / journalists / developers** | Lab notes (`CHAPTER*.md`) and the QEMU-free stack under `xemu_lab/` |
 
-This repo is a **personal forensic laboratory**. Paths, golden images, batch launchers, and menus assume a fixed local layout (e.g. `D:\xemu\…`). It is **not** a drop-in tool for arbitrary PCs — at least not yet.
+### Standalone demo CLI
+
+```bat
+pip install -r requirements.txt
+python xemu_saves.py
+```
+
+The CLI auto-detects the live QCOW2 from `xemu.toml` (portable / OS defaults). If detection fails, you can paste the `.qcow2` path. Close xemu before backup or restore.
+
+The older `xemu_test_lab.py` / `START_XEMU_TEST.bat` entry points are **author lab tooling** (golden catalog, forensic gates). Prefer `xemu_saves.py` for demos and third-party trials.
 
 ---
 
