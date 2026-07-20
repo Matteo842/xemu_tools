@@ -3,3 +3,5 @@
 /__pycache__
 *.pyc
 *.txt
+hdd_backups.json
+START_XEMU_TEST.bat
