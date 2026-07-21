@@ -1,4 +1,4 @@
-"""Componenti interni del laboratorio sicuro per xemu."""
+"""Internal components of the safe xemu lab."""
 
 from .qcow2 import (
     BlockDevice,
